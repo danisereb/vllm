@@ -1383,8 +1383,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         else:
             from vllm.model_executor.layers.fused_moe import fused_experts
-            print("guyueh debug: w13_weight shape: ", layer.w13_weight.shape, flush=True)
-            print("guyueh debug: w2_weight shape: ", layer.w2_weight.shape, flush=True)
             result = fused_experts(
                 hidden_states=x,
                 w1=layer.w13_weight,
