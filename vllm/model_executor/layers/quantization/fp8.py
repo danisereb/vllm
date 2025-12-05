@@ -730,7 +730,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # scales, the output_size of the weights for both the gate and up
             # layers must be divisible by block_n.
             # Required by column parallel or enabling merged weights
-            if intermediate_size_per_partition % block_n != 0:
+            if tp_size > 1 and intermediate_size_per_partition % block_n != 0:
                 raise ValueError(
                     f"The output_size of gate's and up's weight = "
                     f"{intermediate_size_per_partition} is not divisible by "
@@ -1383,7 +1383,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         else:
             from vllm.model_executor.layers.fused_moe import fused_experts
-
+            print("guyueh debug: w13_weight shape: ", layer.w13_weight.shape, flush=True)
+            print("guyueh debug: w2_weight shape: ", layer.w2_weight.shape, flush=True)
             result = fused_experts(
                 hidden_states=x,
                 w1=layer.w13_weight,
