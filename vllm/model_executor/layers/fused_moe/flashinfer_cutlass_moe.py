@@ -4,6 +4,7 @@
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.flashinfer_cutlass_prepare_finalize import (  # noqa: E501
@@ -225,6 +226,10 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
             # Informs FlashInfer to use the block-scale decoding path when True
             use_deepseek_fp8_block_scale=self.use_deepseek_fp8_block_scale,
         )
+
+    def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
+        """Sum top-k expert outputs. Used for LoRA injection."""
+        ops.moe_sum(input, output)
 
 
 def flashinfer_cutlass_moe_fp4(

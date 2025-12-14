@@ -177,6 +177,9 @@ class PackedLoRALayerWeights(LoRALayerWeights):
             w1_lora = loras[eid * 3]
             w2_lora = loras[eid * 3 + 1]
             w3_lora = loras[eid * 3 + 2]
+            if w3_lora is None:
+                # TODO: handle non gated MoE (w3 is None)
+                w3_lora = w1_lora
             assert w1_lora is not None
             assert w2_lora is not None
             assert w3_lora is not None

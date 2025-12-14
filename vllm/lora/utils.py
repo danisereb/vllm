@@ -224,6 +224,9 @@ def get_supported_lora_modules(model: nn.Module) -> list[str]:
     In vLLM, all linear layers support LoRA.
     """
 
+    # Check if the model has a method to filter LoRA modules
+    should_exclude_module = getattr(model, "should_exclude_lora_module", None)
+
     supported_lora_modules: set[str] = set()
     for name, module in model.named_modules():
         # get the embedding modules if the module's embedding_modules
@@ -235,10 +238,20 @@ def get_supported_lora_modules(model: nn.Module) -> list[str]:
 
         # get all the linear subfixes.
         if isinstance(module, (LinearBase,)):
-            supported_lora_modules.add(name.split(".")[-1])
+            module_suffix = name.split(".")[-1]
+            # Allow model to exclude specific modules
+            if should_exclude_module is None or not should_exclude_module(
+                name, module_suffix
+            ):
+                supported_lora_modules.add(module_suffix)
 
         if isinstance(module, (FusedMoE,)):
-            supported_lora_modules.add(name.split(".")[-1])
+            module_suffix = name.split(".")[-1]
+            # Allow model to exclude specific modules
+            if should_exclude_module is None or not should_exclude_module(
+                name, module_suffix
+            ):
+                supported_lora_modules.add(module_suffix)
 
     return list(supported_lora_modules)
 

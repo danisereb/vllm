@@ -632,14 +632,7 @@ class NemotronHModel(nn.Module):
         hidden_states, _ = self.norm_f(hidden_states, residual)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         if self.has_moe:
             # (param_name, weight_name, expert_id, shard_id)
             expert_params_mapping = FusedMoE.make_expert_params_mapping(
@@ -653,8 +646,20 @@ class NemotronHModel(nn.Module):
                 num_experts=self.config.n_routed_experts,
                 num_redundant_experts=getattr(self, "num_redundant_experts", 0),
             )
-        else:
-            expert_params_mapping = []
+            return expert_params_mapping
+
+        # No MoE
+        return []
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+        ]
+
+        expert_params_mapping = self.get_expert_mapping()
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
@@ -870,6 +875,18 @@ class NemotronHForCausalLM(
                 moe.n_physical_experts = num_physical_experts
                 moe.n_redundant_experts = self.num_redundant_experts
                 moe.experts.update_expert_map()
+
+    def should_exclude_lora_module(self, module_name: str, module_suffix: str) -> bool:
+        excludes = [
+            "mixer.conv1d",  # Mamba conv1d
+            "mixer.in_proj",  # Mamba in proj (MergedColumnParallelLinear)
+            "mixer.out_proj",  # Mamba out proj (MergedColumnParallelLinear)
+            # float32, incompatible with LoRA weights (in _lora_shrink)
+            "mixer.gate",
+        ]
+
+        # Returns True if the module should be excluded from LoRA
+        return any(exclude in module_name for exclude in excludes)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
