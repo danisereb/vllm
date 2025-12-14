@@ -154,7 +154,10 @@ class PackedLoRALayerWeights(LoRALayerWeights):
 
     @classmethod
     def pack_moe(
-        cls, loras: GenericSequence[Optional["LoRALayerWeights"]], module_name: str
+        cls,
+        loras: GenericSequence[Optional["LoRALayerWeights"]],
+        module_name: str,
+        is_non_gated_moe: bool = False,
     ) -> "PackedLoRALayerWeights":
         """Pack a list of LoRAs into a single LoRA.
 
@@ -177,8 +180,10 @@ class PackedLoRALayerWeights(LoRALayerWeights):
             w1_lora = loras[eid * 3]
             w2_lora = loras[eid * 3 + 1]
             w3_lora = loras[eid * 3 + 2]
-            if w3_lora is None:
-                # TODO: handle non gated MoE (w3 is None)
+            # For non-gated MoE, w3 is not used, so we use w1's LoRA weights
+            # This is determined by checking the expert mapping (get_expert_mapping)
+            # which indicates when ckpt_up_proj_name is empty.
+            if w3_lora is None and is_non_gated_moe:
                 w3_lora = w1_lora
             assert w1_lora is not None
             assert w2_lora is not None
