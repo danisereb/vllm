@@ -1324,7 +1324,9 @@ class FusedMoE(CustomOp):
                     expert_data=expert_data,
                     tp_rank=self.tp_rank,
                     load_full_w2=getattr(
-                        param, "load_full_w2", True
+                        param,
+                        "load_full_w2",
+                        False,  # TODO: change after TP is fixed
                     ),  # TODO: this is hack only for nemotron, should be removed later
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
