@@ -94,11 +94,7 @@ class MyVllmWorkerExtension:
         from vllm.model_executor.model_loader import get_model_loader
 
         try:
-            model_loader = get_model_loader(self.model_runner.load_config)
-
-            self.model_runner.model.load_weights(
-                model_loader.get_all_weights(self.model_runner.model_config, self.model_runner.model)
-            )
+            self.model_runner.reload_weights()
             process_weights_after_loading(
                 self.model_runner.model,
                 self.model_runner.model_config,
