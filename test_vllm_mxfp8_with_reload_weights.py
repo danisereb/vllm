@@ -111,9 +111,9 @@ async def main():
     # setup envvars
     os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
 
-    # # only uncomment this when using flashinfer 
-    # os.environ["VLLM_USE_FLASHINFER_MOE_FP8"] = "1"
-    # os.environ["VLLM_FLASHINFER_MOE_BACKEND"] = "latency"
+    # only uncomment this when using flashinfer 
+    os.environ["VLLM_USE_FLASHINFER_MOE_FP8"] = "1"
+    os.environ["VLLM_FLASHINFER_MOE_BACKEND"] = "latency"
 
     # Create AsyncLLM engine with simple configuration
     print("🔧 Initializing AsyncLLM...")
@@ -182,7 +182,7 @@ async def main():
         max_logprobs=1,
         logprobs_mode="processed_logprobs",
         enforce_eager=args.enforce_eager,
-        load_format="auto",
+        load_format="dummy",
         hf_overrides=hf_overrides,
         worker_extension_cls=worker_extension,
     )
