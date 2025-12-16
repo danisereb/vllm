@@ -966,18 +966,6 @@ class NemotronHForCausalLM(
                 moe.n_redundant_experts = self.num_redundant_experts
                 moe.experts.update_expert_map()
 
-    def should_exclude_lora_module(self, module_name: str, module_suffix: str) -> bool:
-        excludes = [
-            # "mixer.conv1d",  # Mamba conv1d
-            # "mixer.in_proj",  # Mamba in proj (MergedColumnParallelLinear)
-            # "mixer.out_proj",  # Mamba out proj (MergedColumnParallelLinear)
-            # float32, incompatible with LoRA weights (in _lora_shrink)
-            "mixer.gate",
-        ]
-
-        # Returns True if the module should be excluded from LoRA
-        return any(exclude in module_name for exclude in excludes)
-
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
