@@ -27,11 +27,14 @@ import argparse
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, required=True, help="Path to the BF16 model checkpoint.")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to the model checkpoint.")
     parser.add_argument("--tp", type=int, default=4, help="Tensor parallel size.")
     parser.add_argument("--enforce-eager", action="store_true", default=False, help="Enforce eager mode in vllm.")
     parser.add_argument("--bf16", action="store_true", default=False, help="Use BF16 model instead of quantization.")
     parser.add_argument("--reload-weights", action="store_true", default=False, help="Reload weights after refit.")
+    parser.add_argument("--weight-scheme", type=str, default="dynamic", choices=["dynamic", "static"], help="Weight scheme for quantization.")
+    parser.add_argument("--load-format", type=str, default="auto", choices=["dummy", "auto"], help="Load format for the model.")
+    parser.add_argument("--fused-moe-backend", type=str, default="flashinfer", choices=["flashinfer", "default"], help="Fused MOE backend for the model.")
     return parser.parse_args()
 
 
@@ -111,16 +114,18 @@ async def main():
     # setup envvars
     os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
 
-    # only uncomment this when using flashinfer 
-    os.environ["VLLM_USE_FLASHINFER_MOE_FP8"] = "1"
-    os.environ["VLLM_FLASHINFER_MOE_BACKEND"] = "latency"
+    if args.fused_moe_backend == "flashinfer":
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP8"] = "1"
+        os.environ["VLLM_FLASHINFER_MOE_BACKEND"] = "latency"
+    else:
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP8"] = "0"
 
     # Create AsyncLLM engine with simple configuration
     print("🔧 Initializing AsyncLLM...")
     mxfp8_hf_overrides = {
         "quantization_config": {
             "activation_scheme": "dynamic",
-            "weight_scheme": "dynamic",
+            "weight_scheme": args.weight_scheme,
             "quant_method": "fp8",
             "is_mx": True,
             "ignore": [
@@ -182,7 +187,7 @@ async def main():
         max_logprobs=1,
         logprobs_mode="processed_logprobs",
         enforce_eager=args.enforce_eager,
-        load_format="dummy",
+        load_format=args.load_format,
         hf_overrides=hf_overrides,
         worker_extension_cls=worker_extension,
     )
@@ -230,6 +235,7 @@ async def main():
                     "enforce_eager": args.enforce_eager,
                     "bf16": args.bf16,
                     "reload_weights": args.reload_weights,
+                    "fused_moe_backend": args.fused_moe_backend,
                     "vllm_commit_id": vllm_commit_id,
                 }
                 output = config
