@@ -480,6 +480,38 @@ if has_flashinfer():
             A.shape[0], A.shape[1], B.shape[2], dtype=dtype, device=A.device
         )
 
+    @torch.library.custom_op(
+        "vllm::bmm_mxfp8",
+        mutates_args=[],
+        device_types="cuda",
+    )
+    def bmm_mxfp8(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        dtype: torch.dtype,
+        backend: str,
+    ) -> torch.Tensor:
+        from flashinfer import bmm_mxfp8 as bmm_mxfp8_
+
+        return bmm_mxfp8_(A, B, A_scale, B_scale, dtype, None, backend)
+
+    @torch.library.register_fake(
+        "vllm::bmm_mxfp8",
+    )
+    def bmm_mxfp8_fake(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        dtype: torch.dtype,
+        backend: str,
+    ) -> torch.Tensor:
+        return torch.empty(
+            A.shape[0], A.shape[1], B.shape[2], dtype=dtype, device=A.device
+        )
+
 
 def flashinfer_scaled_fp4_mm(
     a: torch.Tensor,
@@ -540,6 +572,41 @@ def flashinfer_scaled_fp8_mm(
     return output
 
 
+def flashinfer_scaled_mxfp8_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    assert a.ndim == 2 and b.ndim == 2
+    assert a.shape[1] == b.shape[0]
+    # mxfp8 block size is 32
+    assert scale_a.numel() == (a.numel() // 32)
+    assert scale_b.numel() == (b.numel() // 32)
+
+    assert a.dtype == torch.float8_e4m3fn and b.dtype == torch.float8_e4m3fn
+    assert a.device.type == "cuda" and b.device.type == "cuda"
+
+    # mxfp8 scale is fp8 (E8M0)
+    assert scale_a.dtype == torch.uint8 and scale_b.dtype == torch.uint8
+    assert scale_a.device.type == "cuda" and scale_b.device.type == "cuda"
+
+    output = bmm_mxfp8(
+        a.unsqueeze(0),
+        b.unsqueeze(0),
+        scale_a,
+        scale_b,
+        out_dtype,
+        "auto",
+    ).view(a.shape[0], b.shape[1])
+
+    if bias is not None:
+        output = output + bias
+    return output
+
+
 __all__ = [
     "has_flashinfer",
     "flashinfer_trtllm_fp8_block_scale_moe",
@@ -562,4 +629,5 @@ __all__ = [
     "use_trtllm_attention",
     "flashinfer_scaled_fp4_mm",
     "flashinfer_scaled_fp8_mm",
+    "flashinfer_scaled_mxfp8_mm",
 ]

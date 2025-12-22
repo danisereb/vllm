@@ -12,7 +12,11 @@ from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
-from vllm.utils.flashinfer import flashinfer_scaled_fp8_mm, has_flashinfer
+from vllm.utils.flashinfer import (
+    flashinfer_scaled_fp8_mm,
+    flashinfer_scaled_mxfp8_mm,
+    has_flashinfer,
+)
 from vllm.utils.platform_utils import get_cu_count
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -177,6 +181,22 @@ def flashinfer_w8a8_scaled_mm(
     **kwargs,
 ) -> torch.Tensor:
     return flashinfer_scaled_fp8_mm(
+        qinput, weight, out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b, bias=bias
+    )
+
+
+def flashinfer_w8a8_scaled_mm_mxfp8(
+    *,
+    qinput: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    bias: torch.Tensor,
+    output_shape: list,
+    **kwargs,
+) -> torch.Tensor:
+    return flashinfer_scaled_mxfp8_mm(
         qinput, weight, out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b, bias=bias
     )
 
@@ -485,6 +505,60 @@ class Fp8LinearOp:
         )
 
         return w8a8_scaled_mm_func(
+            qinput=qinput,
+            weight=weight,
+            out_dtype=out_dtype,
+            scale_a=x_scale,
+            scale_b=weight_scale,
+            bias=bias,
+            output_shape=output_shape,
+        )
+
+
+class Mxfp8LinearOp:
+    """
+    This class executes a MXFP8 linear layer using flashinfer.
+    """
+
+    def __init__(
+        self,
+        act_quant_static: bool,
+        act_quant_group_shape: GroupShape = GroupShape.PER_TENSOR,
+        pad_output: bool | None = None,
+    ) -> None:
+        if (
+            current_platform.is_cuda()
+            and current_platform.has_device_capability(100)
+            and has_flashinfer()
+        ):
+            self.preferred_backend = "flashinfer"
+        else:
+            raise ValueError("MXFP8 is not supported")
+
+    def apply(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype | None = None,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        from flashinfer.fp8_quantization import mxfp8_quantize
+
+        # View input as 2D matrix for fp8 methods
+        input_2d = input.view(-1, input.shape[-1])
+        output_shape = [*input.shape[:-1], weight.shape[1]]
+
+        if out_dtype is None:
+            out_dtype = input.dtype
+
+        # MXFP8 block size is 32
+        qinput, x_scale = mxfp8_quantize(
+            input=input_2d,
+            is_sf_swizzled_layout=True,
+        )
+
+        return flashinfer_w8a8_scaled_mm_mxfp8(
             qinput=qinput,
             weight=weight,
             out_dtype=out_dtype,
