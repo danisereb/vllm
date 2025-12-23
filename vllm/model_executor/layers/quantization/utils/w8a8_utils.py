@@ -558,6 +558,10 @@ class Mxfp8LinearOp:
             is_sf_swizzled_layout=True,
         )
 
+        # Both weights and activations should be MXFP8
+        assert qinput.dtype == weight.dtype
+        assert x_scale.dtype == weight_scale.dtype
+
         return flashinfer_w8a8_scaled_mm_mxfp8(
             qinput=qinput,
             weight=weight,
