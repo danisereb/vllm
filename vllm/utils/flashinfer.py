@@ -512,6 +512,38 @@ if has_flashinfer():
             A.shape[0], A.shape[1], B.shape[2], dtype=dtype, device=A.device
         )
 
+    # Register mxfp8_quantize as a custom op to avoid Dynamo tracing issues
+    # with file system operations during module loading
+    @torch.library.custom_op(
+        "vllm::mxfp8_quantize",
+        mutates_args=[],
+        device_types="cuda",
+    )
+    def mxfp8_quantize_op(
+        input: torch.Tensor,
+        is_sf_swizzled_layout: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from flashinfer.fp8_quantization import mxfp8_quantize as mxfp8_quantize_
+
+        return mxfp8_quantize_(input=input, is_sf_swizzled_layout=is_sf_swizzled_layout)
+
+    @torch.library.register_fake(
+        "vllm::mxfp8_quantize",
+    )
+    def mxfp8_quantize_fake(
+        input: torch.Tensor,
+        is_sf_swizzled_layout: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # MXFP8 block size is 32, so scales have shape matching block layout
+        # For a 2D input [M, K], scales are organized as blocks
+        # The exact shape depends on flashinfer's internal layout, but we approximate
+        # with a flattened tensor of the right total size
+        num_blocks = input.numel() // 32
+        qinput = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        # Scales are uint8 (E8M0 format) for MXFP8
+        x_scale = torch.empty(num_blocks, dtype=torch.uint8, device=input.device)
+        return qinput, x_scale
+
 
 def flashinfer_scaled_fp4_mm(
     a: torch.Tensor,
