@@ -20,6 +20,11 @@ from vllm.utils.flashinfer import (
 from vllm.utils.platform_utils import get_cu_count
 from vllm.utils.torch_utils import direct_register_custom_op
 
+try:
+    from flashinfer.fp8_quantization import mxfp8_quantize
+except ImportError:
+    mxfp8_quantize = None
+
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
 TORCH_DEVICE_IDENTITY = None
@@ -543,8 +548,6 @@ class Mxfp8LinearOp:
         out_dtype: torch.dtype | None = None,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from flashinfer.fp8_quantization import mxfp8_quantize
-
         # View input as 2D matrix for fp8 methods
         input_2d = input.view(-1, input.shape[-1])
         output_shape = [*input.shape[:-1], weight.shape[1]]
@@ -553,10 +556,21 @@ class Mxfp8LinearOp:
             out_dtype = input.dtype
 
         # MXFP8 block size is 32
-        qinput, x_scale = mxfp8_quantize(
-            input=input_2d,
-            is_sf_swizzled_layout=True,
-        )
+        # Use torch.ops wrapper to avoid Dynamo tracing issues with file system ops
+        # The custom op registration handles the lazy module loading safely
+        if hasattr(torch.ops.vllm, "mxfp8_quantize"):
+            qinput, x_scale = torch.ops.vllm.mxfp8_quantize(
+                input_2d,
+                True,
+            )
+        else:
+            # Fallback to direct call if op not registered (shouldn't happen)
+            if mxfp8_quantize is None:
+                raise ValueError("mxfp8_quantize is not available")
+            qinput, x_scale = mxfp8_quantize(
+                input=input_2d,
+                is_sf_swizzled_layout=True,
+            )
 
         # Both weights and activations should be MXFP8
         assert qinput.dtype == weight.dtype
