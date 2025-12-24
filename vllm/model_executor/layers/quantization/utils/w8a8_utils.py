@@ -10,8 +10,13 @@ from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    block_scaled_matmul,
+    block_scaled_matmul_fake,
+    mxfp8_e4m3_quantize,
+    mxfp8_e4m3_quantize_python,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
-from vllm.model_executor.layers.quantization.utils.mxfp8_utils import mxfp8_e4m3_quantize_python, block_scaled_matmul, block_scaled_matmul_fake, dequant_mxfp8_to_bf16, mxfp8_e4m3_quantize
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import flashinfer_scaled_fp8_mm, has_flashinfer
 from vllm.utils.platform_utils import get_cu_count
@@ -504,6 +509,8 @@ direct_register_custom_op(
     op_func=mxfp8_e4m3_quantize,
     fake_impl=mxfp8_e4m3_quantize_python,
 )
+
+
 class MXFp8LinearOp:
     """
     This class executes a MXFP8 linear layer using pytorch.
@@ -513,9 +520,57 @@ class MXFp8LinearOp:
 
     def __init__(
         self,
+        use_flashinfer: bool = False,
     ):
-        
-        self.preferred_backend = "triton"        
+        self.preferred_backend = "triton"
+        if use_flashinfer:
+            self.preferred_backend = "flashinfer"
+
+    def _apply_flashinfer(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # From bf16 to mxfp8
+        swizzled = True
+        # q_input, input_scales = mxfp8_e4m3_quantize(input, swizzled)
+        q_input, input_scales = torch.ops.vllm.mxfp8_quantize(input, swizzled)
+
+        # Weights should be mxfp8
+        assert q_input.dtype == weight.dtype
+        assert input_scales.dtype == weight_scale.dtype
+
+        input_was_2d = False
+        if q_input.ndim == 2:
+            input_was_2d = True
+            # bmm_mxfp8 requires 3D shape
+            q_input = q_input.unsqueeze(0)
+            input_scales = input_scales.unsqueeze(0)
+
+        if weight.ndim == 2:
+            # bmm_mxfp8 requires 3D shape
+            weight = weight.unsqueeze(0)
+            weight_scale = weight_scale.unsqueeze(0)
+
+        # Use bmm-mxfp8 from flashinfer
+        output = torch.ops.vllm.bmm_mxfp8(
+            A=q_input,  # Shape: [b, m, k]
+            B=weight.transpose(-2, -1),  # Shape: [b, k, n]
+            A_scale=input_scales,
+            B_scale=weight_scale,
+            dtype=out_dtype,
+            backend="cudnn",
+        )
+
+        # Remove batch dimension if it was added
+        if input_was_2d:
+            output = output.squeeze(0)
+
+        return output
+
     def apply(
         self,
         input: torch.Tensor,
@@ -527,6 +582,10 @@ class MXFp8LinearOp:
         """
         Apply linear layer in fake MXFP8 with block-wise matmul and dequantization.
         """
+
+        if self.preferred_backend == "flashinfer":
+            return self._apply_flashinfer(input, weight, weight_scale, out_dtype, bias)
+
         fake = False
         if fake:
             # q_input, input_scales = mxfp8_e4m3_quantize_python(input, False)
@@ -535,7 +594,7 @@ class MXFp8LinearOp:
 
             output = torch.matmul(input, weight.T)
             return output
-        
+
         q_input, input_scales = torch.ops.vllm.mxfp8_quantize(input, True)
         output = torch.ops.vllm.block_scaled_matmul2(
             q_input,

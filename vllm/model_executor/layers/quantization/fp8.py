@@ -220,6 +220,7 @@ class Fp8Config(QuantizationConfig):
         ignored_layers: list[str] | None = None,
         weight_block_size: list[int] | None = None,
         is_mx: bool = False,
+        use_flashinfer: bool = False,
         weight_scheme: str = "static",
     ) -> None:
         super().__init__()
@@ -248,6 +249,7 @@ class Fp8Config(QuantizationConfig):
                     f"{activation_scheme} activation scheme."
                 )
         self.is_mx = is_mx
+        self.use_flashinfer = use_flashinfer
         self.weight_block_size = weight_block_size
         self.weight_scheme = weight_scheme
 
@@ -279,6 +281,7 @@ class Fp8Config(QuantizationConfig):
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         is_mx = cls.get_from_keys_or(config, ["is_mx"], False)
+        use_flashinfer = cls.get_from_keys_or(config, ["use_flashinfer"], False)
         weight_scheme = cls.get_from_keys_or(config, ["weight_scheme"], "static")
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(
@@ -290,6 +293,7 @@ class Fp8Config(QuantizationConfig):
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             is_mx=is_mx,
+            use_flashinfer=use_flashinfer,
             weight_scheme=weight_scheme,
         )
 
@@ -433,7 +437,8 @@ class Fp8LinearMethod(LinearMethodBase):
             )
         elif quant_config.is_mx:
             self.weight_block_size = [1, 32]
-            self.fp8_linear = MXFp8LinearOp()
+            use_flashinfer = self.quant_config.use_flashinfer
+            self.fp8_linear = MXFp8LinearOp(use_flashinfer=use_flashinfer)
         else:
             self.fp8_linear = Fp8LinearOp(
                 act_quant_static=self.act_q_static,
@@ -1412,7 +1417,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             #     f"Expected 'silu' activation but got {activation}"
             # )
 
-            if self.block_quant:
+            if True:  # self.block_quant:
                 import vllm.model_executor.layers.fused_moe.flashinfer_trtllm_moe  # noqa: E501, F401
 
                 e_score_correction_bias = (

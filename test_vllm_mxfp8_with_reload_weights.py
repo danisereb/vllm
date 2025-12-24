@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--tp", type=int, default=4, help="Tensor parallel size.")
     parser.add_argument("--enforce-eager", action="store_true", default=False, help="Enforce eager mode in vllm.")
     parser.add_argument("--bf16", action="store_true", default=False, help="Use BF16 model instead of quantization.")
+    parser.add_argument("--use-flashinfer", action="store_true", default=False, help="Use flashinfer for MXFP8 quantization.")
     parser.add_argument("--reload-weights", action="store_true", default=False, help="Reload weights after refit.")
     parser.add_argument("--weight-scheme", type=str, default="dynamic", choices=["dynamic", "static"], help="Weight scheme for quantization.")
     parser.add_argument("--load-format", type=str, default="auto", choices=["dummy", "auto"], help="Load format for the model.")
@@ -128,6 +129,7 @@ async def main():
             "weight_scheme": args.weight_scheme,
             "quant_method": "fp8",
             "is_mx": True,
+            "use_flashinfer": args.use_flashinfer,
             "ignore": [
                 "backbone.layers.46.mixer.conv1d",
                 "backbone.layers.57.mixer.conv1d",

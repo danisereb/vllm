@@ -16,6 +16,10 @@ def mxfp8_e4m3_quantize_python(
     is_sf_swizzled_layout: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
+    #from vllm.model_executor.layers.quantization.utils.mxfp8_utils import mxfp8_e4m3_quantize
+
+    #return mxfp8_e4m3_quantize(data, is_sf_swizzled_layout)
+
     # ---- NEW: support 3D ----
     if data.ndim == 2:
         data = data.unsqueeze(0)     # treat as batch=1
