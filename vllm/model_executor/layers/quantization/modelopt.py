@@ -502,6 +502,9 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 f"Using FlashInfer {self.flashinfer_moe_backend.value} kernels"
             )
 
+        if self.flashinfer_moe_backend is None:
+            logger.info_once("Using Triton as the MoE backend")
+
     def maybe_make_prepare_finalize(
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
@@ -524,10 +527,20 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
     ) -> mk.FusedMoEPermuteExpertsUnpermute:
         assert self.moe_quant_config is not None
-        experts = select_cutlass_fp8_gemm_impl(
-            self.moe,
-            self.moe_quant_config,
-        )
+        if self.flashinfer_moe_backend is None:
+            from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
+
+            # Use TritonExperts for non-gated MoE
+            # Required to support LoRA for non-gated MoE
+            return TritonExperts(
+                quant_config=self.moe_quant_config,
+            )
+        else:
+            experts = select_cutlass_fp8_gemm_impl(
+                self.moe,
+                self.moe_quant_config,
+            )
+
         logger.debug_once("Using %s", experts.__class__.__name__)
         return experts
 
