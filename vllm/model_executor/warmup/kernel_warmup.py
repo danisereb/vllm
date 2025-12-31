@@ -38,7 +38,15 @@ def kernel_warmup(worker: "Worker"):
 
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if has_flashinfer() and current_platform.has_device_capability(90):
-        flashinfer_autotune(worker.model_runner)
+        quant_method = getattr(worker.model_runner.model_config, "quantization", None)
+        if quant_method == "modelopt_mxfp8" and not envs.VLLM_FLASHINFER_AUTOTUNE_MXFP8:
+            logger.warning(
+                "Skipping FlashInfer autotune for MXFP8 GEMM due to "
+                "known CUTLASS TMA instability. Set "
+                "VLLM_FLASHINFER_AUTOTUNE_MXFP8=1 to force autotune."
+            )
+        else:
+            flashinfer_autotune(worker.model_runner)
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups

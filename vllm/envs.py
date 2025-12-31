@@ -177,6 +177,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_MOE_BACKEND: Literal["throughput", "latency", "masked_gemm"] = (
         "latency"
     )
+    VLLM_FLASHINFER_AUTOTUNE_MXFP8: bool = False
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1337,6 +1338,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "latency",
         ["throughput", "latency", "masked_gemm"],
     ),
+    # Whether to allow FlashInfer autotune for MXFP8 GEMM.
+    # Autotuning may hit CUTLASS TMA issues on some SM100 kernels.
+    "VLLM_FLASHINFER_AUTOTUNE_MXFP8": lambda: os.environ.get(
+        "VLLM_FLASHINFER_AUTOTUNE_MXFP8", "0"
+    )
+    .strip()
+    .lower()
+    in ("1", "true"),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
