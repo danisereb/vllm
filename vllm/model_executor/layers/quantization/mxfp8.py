@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -9,13 +9,19 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
 )
-from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import Mxfp8LinearOp
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -34,8 +40,13 @@ class Mxfp8Config(QuantizationConfig):
         self.ignored_layers = ignored_layers
 
     @classmethod
-    def from_config(cls, config):
-        return cls()
+    def from_config(cls, config: dict[str, Any]) -> "Mxfp8Config":
+        quant_method = cls.get_from_keys(config, ["quant_method"])
+        is_serialized = "mxfp8" in quant_method
+        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+
+        assert is_serialized, "MXFP8 is only supported in serialized format"
+        return cls(ignored_layers=ignored_layers)
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -64,13 +75,7 @@ class Mxfp8Config(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
 
-            # TODO: Add support for MXFP8 Linear Method.
-            logger.debug_once(
-                "MXFP8 linear layer is not implemented - falling back to "
-                "UnquantizedLinearMethod.",
-                scope="local",
-            )
-            return UnquantizedLinearMethod()
+            return Mxfp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             # TODO: Add support for MXFP8 MoE.
             logger.debug_once(
@@ -86,3 +91,41 @@ class Mxfp8Config(QuantizationConfig):
                 scope="local",
             )
         return None
+
+
+class Mxfp8LinearMethod(LinearMethodBase):
+    def __init__(self, quant_config: Mxfp8Config):
+        self.quant_config = quant_config
+
+        # TODO: check
+        self.out_dtype = torch.get_default_dtype()
+
+        assert current_platform.is_cuda(), "MXFP8 is only supported on CUDA"
+
+        self.mxfp8_linear = Mxfp8LinearOp()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        pass
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.mxfp8_linear.apply(
+            input=x,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            out_dtype=self.out_dtype,
+            bias=bias,
+        )
