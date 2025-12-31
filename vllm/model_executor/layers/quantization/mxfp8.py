@@ -106,19 +106,19 @@ class Mxfp8Config(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
 
-            logger.info("Using MXFP8 for layer %s", prefix)
+            logger.debug("Using MXFP8 for layer %s", prefix)
             return Mxfp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            # TODO: Add support for MXFP8 MoE using Mxfp8MoEMethod
             return Mxfp8MoEMethod(self, layer)
         elif isinstance(layer, Attention):
-            # TODO: Add support for MXFP8 Attention.
-            logger.info_once(
+            # TODO: Add support for MXFP8 Attention
+            logger.debug_once(
                 "MXFP8 attention layer is not implemented. "
                 "Skipping quantization for this layer.",
                 scope="local",
             )
-        logger.info("Return UnquantizedLinearMethod for %s", prefix)
+
+        # TODO: return None?
         return UnquantizedLinearMethod
 
 
