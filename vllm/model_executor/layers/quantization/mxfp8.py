@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable
 from functools import partial
 from math import ceil
 from typing import Any, Optional
@@ -18,7 +17,6 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
-    RoutingMethodType,
     mxfp8_fake_w8a8_moe_quant_config,
 )
 from vllm.model_executor.layers.linear import (
@@ -231,7 +229,16 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
         self.use_marlin = self.fp8_backend == Fp8MoeBackend.MARLIN
         self.flashinfer_moe_backend: FlashinferMoeBackend | None = None
         if self.fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM:
-            self.flashinfer_moe_backend = FlashinferMoeBackend.TENSORRT_LLM
+            if not self.moe.is_act_and_mul:
+                # Non-gated MoE is not supported for TENSORRT_LLM backend,
+                # fall back to CUTLASS
+                logger.info_once(
+                    "Non-gated MoE is not supported for TENSORRT_LLM backend, "
+                    "falling back to CUTLASS backend"
+                )
+                self.flashinfer_moe_backend = FlashinferMoeBackend.CUTLASS
+            else:
+                self.flashinfer_moe_backend = FlashinferMoeBackend.TENSORRT_LLM
         elif self.fp8_backend == Fp8MoeBackend.FLASHINFER_CUTLASS:
             self.flashinfer_moe_backend = FlashinferMoeBackend.CUTLASS
             if self.block_quant:
@@ -259,15 +266,14 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.hidden_size = hidden_size
         layer.num_experts = num_experts
-        layer.orig_dtype = params_dtype
+        layer.orig_dtype = params_dtype  # TODO: do we need this?
         layer.weight_block_size = None
         quant_method = None
 
-        if (
-            self.quant_config.is_checkpoint_fp8_serialized
-            and self.quant_config.weight_scheme == "static"
-        ):
-            params_dtype = torch.float8_e4m3fn
+        # TODO: add assert for MXFP8 weights?
+        # Assume MXFP8 weights are FP8 E4M3
+        params_dtype = torch.float8_e4m3fn
+
         if self.block_quant:
             assert self.weight_block_size is not None
             layer.weight_block_size = self.weight_block_size
@@ -293,7 +299,7 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
                     f"{intermediate_size_per_partition} is not divisible by "
                     f"weight quantization block_k = {block_k}."
                 )
-        numu_shards = 2 if layer.is_gated else 1
+        numu_shards = 2 if self.moe.is_act_and_mul else 1
 
         intermediate_size_per_partition = (
             self._maybe_increase_intermediate_size_for_mxfp8(
@@ -349,7 +355,7 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        quant_method = FusedMoeWeightScaleSupported.MXFP8.value
+        quant_method = FusedMoeWeightScaleSupported.BLOCK.value
 
         assert quant_method is not None, "quant_method should be set"
         extra_weight_attrs.update({"quant_method": quant_method})
@@ -432,59 +438,26 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: int | None = None,
-        num_expert_group: int | None = None,
-        global_num_experts: int = -1,
-        expert_map: torch.Tensor | None = None,
-        custom_routing_function: Callable | None = None,
-        scoring_func: str = "softmax",
-        routed_scaling_factor: float = 1.0,
-        e_score_correction_bias: torch.Tensor | None = None,
-        apply_router_weight_on_input: bool = False,
-        activation: str = "silu",
-        enable_eplb: bool = False,
-        expert_load_view: torch.Tensor | None = None,
-        logical_to_physical_map: torch.Tensor | None = None,
-        logical_replica_count: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if enable_eplb:
-            assert expert_load_view is not None
-            assert logical_to_physical_map is not None
-            assert logical_replica_count is not None
-            assert isinstance(layer, FusedMoE)
+        # After process_weights_after_loading, weights are dequantized to bf16.
+        # Use unquantized fused_experts kernel for inference.
+        from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 
-        assert self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM
-        import vllm.model_executor.layers.fused_moe.flashinfer_trtllm_moe  # noqa: E501, F401
-
-        e_score_correction_bias = (
-            e_score_correction_bias.to(x.dtype)
-            if e_score_correction_bias is not None
-            else None
+        # Expert selection
+        topk_weights, topk_ids = layer.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
         )
-        routing_method_type = layer.routing_method_type
 
-        if routing_method_type == RoutingMethodType.DeepSeekV3:
-            router_logits = router_logits.to(torch.float32)
-
-        return torch.ops.vllm.flashinfer_fused_moe_blockscale_fp8(
-            routing_logits=router_logits,
-            routing_bias=e_score_correction_bias,
-            x=x,
-            w13_weight=layer.w13_weight,
-            w13_weight_scale_inv=layer.w13_weight_scale_inv,
-            w2_weight=layer.w2_weight,
-            w2_weight_scale_inv=layer.w2_weight_scale_inv,
-            global_num_experts=global_num_experts,
-            top_k=top_k,
-            num_expert_group=num_expert_group,
-            topk_group=topk_group,
-            intermediate_size=layer.intermediate_size_per_partition,
-            expert_offset=layer.ep_rank * layer.local_num_experts,
-            local_num_experts=layer.local_num_experts,
-            block_shape=self.weight_block_size,
-            routing_method_type=routing_method_type,
-            routed_scaling=routed_scaling_factor,
+        return fused_experts(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=True,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
         )
