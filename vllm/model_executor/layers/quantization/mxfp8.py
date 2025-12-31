@@ -21,6 +21,11 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import Mxfp8LinearOp
+from vllm.model_executor.parameter import (
+    BlockQuantScaleParameter,
+    ModelWeightParameter,
+)
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -94,7 +99,7 @@ class Mxfp8Config(QuantizationConfig):
 
 
 class Mxfp8LinearMethod(LinearMethodBase):
-    def __init__(self, quant_config: Mxfp8Config):
+    def __init__(self, quant_config: Mxfp8Config) -> None:
         self.quant_config = quant_config
 
         # TODO: check
@@ -113,8 +118,58 @@ class Mxfp8LinearMethod(LinearMethodBase):
         output_size: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
-    ):
-        pass
+    ) -> None:
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        # Store metadata on the layer for later use
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+
+        # Create weight parameter in F8_E4M3 format
+        # Shape: [output_size_per_partition, input_size_per_partition]
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=torch.float8_e4m3fn,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        # MXFP8 uses block size of 32
+        mxfp8_block_size = 32
+
+        # Create weight scale parameter in U8 format (E8M0 - power-of-2 exponents)
+        # MXFP8 has one scale per block of 32 elements along the K dimension
+        # Shape: [output_size_per_partition, ceil(input_size_per_partition / 32)]
+        num_scale_elements = (
+            input_size_per_partition + mxfp8_block_size - 1
+        ) // mxfp8_block_size
+        weight_scale = BlockQuantScaleParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                num_scale_elements,
+                dtype=torch.uint8,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
+        set_weight_attrs(weight_scale, {"scale_type": "weight_scale"})
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if layer.weight.dtype != torch.float8_e4m3fn:
+            raise ValueError("MXFP8 weights must be in float8_e4m3fn format")
+
+        if layer.weight_scale.dtype != torch.uint8:
+            raise ValueError("MXFP8 weight_scale must be in uint8 format (E8M0)")
 
     def apply(
         self,
