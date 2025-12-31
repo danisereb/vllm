@@ -480,6 +480,46 @@ if has_flashinfer():
             A.shape[0], A.shape[1], B.shape[2], dtype=dtype, device=A.device
         )
 
+    @torch.library.custom_op(
+        "vllm::bmm_mxfp8",
+        mutates_args=[],
+        device_types="cuda",
+    )
+    def bmm_mxfp8(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        dtype: torch.dtype,
+        backend: str = "cudnn",
+    ) -> torch.Tensor:
+        from flashinfer import bmm_mxfp8 as bmm_mxfp8_
+
+        return bmm_mxfp8_(
+            A=A,
+            B=B,
+            A_scale=A_scale,
+            B_scale=B_scale,
+            dtype=dtype,
+            backend=backend,
+            out=None,
+        )
+
+    @torch.library.register_fake(
+        "vllm::bmm_mxfp8",
+    )
+    def bmm_mxfp8_fake(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        dtype: torch.dtype,
+        backend: str = "cudnn",
+    ) -> torch.Tensor:
+        return torch.empty(
+            A.shape[0], A.shape[1], B.shape[2], dtype=dtype, device=A.device
+        )
+
 
 def flashinfer_scaled_fp4_mm(
     a: torch.Tensor,
