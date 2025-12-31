@@ -521,15 +521,13 @@ def normalize_e4m3fn_to_e4m3fnuz(
 
 class Mxfp8LinearOp:
     """
-    This class executes a MXFP8 linear layer using pytorch.
-    It needs to be a class instead of a method so that config can be read
-    in the __init__ method, as reading config is not allowed inside forward.
+    This class executes a MXFP8 linear layer.
     """
 
     def __init__(
         self,
     ):
-        self.preferred_backend = "triton"
+        pass
 
     def apply(
         self,
@@ -539,26 +537,5 @@ class Mxfp8LinearOp:
         out_dtype: torch.dtype,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Apply linear layer in fake MXFP8 with block-wise matmul and dequantization.
-        """
-        fake = False
-        if fake:
-            # q_input, input_scales = mxfp8_e4m3_quantize_python(input, False)
-            # dq_input = dequant_mxfp8_to_bf16(q_input, input_scales)
-            # dq_weight = dequant_mxfp8_to_bf16(weight, weight_scale)
-
-            output = torch.matmul(input, weight.T)
-            return output
-
-        q_input, input_scales = torch.ops.vllm.mxfp8_quantize(input, True)
-        output = torch.ops.vllm.block_scaled_matmul2(
-            q_input,
-            input_scales,
-            weight,
-            weight_scale,
-            out_dtype,
-            "mxfp8",
-            True,
-        )
-        return output
+        # TODO: use bmm_mxfp8 from flashinfer main
+        return input.to(torch.bfloat16) @ weight.T.to(torch.bfloat16)
