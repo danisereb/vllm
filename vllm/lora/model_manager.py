@@ -104,7 +104,11 @@ class LoRAModelManager:
         self.modules: dict[str, BaseLayerWithLoRA] = {}
         # Dict instead of a set for compatibility with LRUCache.
         self._last_mapping: LoRAMapping | None = None
-        self._is_3d_moe_model = is_moe_model(self.model) and self.model.is_3d_moe_weight
+
+        is_moe = is_moe_model(self.model)
+        self._is_3d_moe_model = is_moe and self.model.is_3d_moe_weight
+        self._is_non_gated_moe = is_moe and self.model.is_non_gated_moe
+
         self._init_punica_wrapper(max_num_batched_tokens, vllm_config)
         self._create_lora_modules()
 
@@ -545,7 +549,9 @@ class LoRAModelManager:
                     )
                     subloras.append(lora)
                 if module.__class__.__name__ == "FusedMoEWithLoRA":
-                    lora = PackedLoRALayerWeights.pack_moe(subloras, module_name)
+                    lora = PackedLoRALayerWeights.pack_moe(
+                        subloras, module_name, is_non_gated_moe=self._is_non_gated_moe
+                    )
                 else:
                     lora = PackedLoRALayerWeights.pack(subloras)
                 model.loras[module_name] = lora
@@ -625,6 +631,7 @@ class LoRAModelManager:
                 lora_model.loras.pop(module, None)
 
         for lora in lora_model.loras.values():
+            assert lora is not None  # Avoid mypy error
             lora.optimize()
 
         first_lora: LoRALayerWeights = next(iter(lora_model.loras.values()))
@@ -643,6 +650,7 @@ class LoRAModelManager:
         pin_memory = str(lora_device) == "cpu" and is_pin_memory_available()
         if pin_memory:
             for lora in lora_model.loras.values():
+                assert lora is not None  # Avoid mypy error
                 if isinstance(lora.lora_a, list):
                     for index in range(len(lora.lora_a)):
                         if lora.lora_a[index] is None:
