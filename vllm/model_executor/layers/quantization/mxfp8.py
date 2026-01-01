@@ -52,6 +52,10 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 
+MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
+MXFP8_SCALE_DTYPE = torch.uint8
+
+
 class Mxfp8Config(QuantizationConfig):
     """
     Example config:
@@ -158,7 +162,7 @@ class Mxfp8LinearMethod(LinearMethodBase):
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition,
-                dtype=torch.float8_e4m3fn,
+                dtype=MXFP8_VALUE_DTYPE,
             ),
             input_dim=1,
             output_dim=0,
@@ -179,7 +183,7 @@ class Mxfp8LinearMethod(LinearMethodBase):
             data=torch.empty(
                 output_size_per_partition,
                 num_scale_elements,
-                dtype=torch.uint8,
+                dtype=MXFP8_SCALE_DTYPE,
             ),
             input_dim=1,
             output_dim=0,
@@ -189,10 +193,10 @@ class Mxfp8LinearMethod(LinearMethodBase):
         set_weight_attrs(weight_scale, {"scale_type": "weight_scale"})
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if layer.weight.dtype != torch.float8_e4m3fn:
+        if layer.weight.dtype != MXFP8_VALUE_DTYPE:
             raise ValueError("MXFP8 weights must be in float8_e4m3fn format")
 
-        if layer.weight_scale.dtype != torch.uint8:
+        if layer.weight_scale.dtype != MXFP8_SCALE_DTYPE:
             raise ValueError("MXFP8 weight_scale must be in uint8 format (E8M0)")
 
     def apply(
@@ -207,6 +211,50 @@ class Mxfp8LinearMethod(LinearMethodBase):
             weight_scale=layer.weight_scale,
             out_dtype=self.out_dtype,
             bias=bias,
+        )
+
+
+def validate_moe_block_sizes(
+    intermediate_size_per_partition: int,
+    hidden_size: int,
+    weight_block_size: list[int],
+    tp_size: int = 1,
+) -> None:
+    """
+    Validate that MoE weight dimensions are compatible with block quantization.
+
+    This function validates alignment requirements for block-wise quantized
+    MoE weights with tensor parallelism.
+
+    Args:
+        intermediate_size_per_partition: The intermediate size per partition
+            (output size for gate/up, input size for down).
+        hidden_size: The hidden size of the model.
+        weight_block_size: Block size as [block_n, block_k].
+        tp_size: Tensor parallel size (default 1).
+
+    Raises:
+        ValueError: If dimensions are not divisible by block sizes.
+    """
+    block_n, block_k = weight_block_size[0], weight_block_size[1]
+
+    # NOTE: To ensure proper alignment of the block-wise quantization
+    # scales, the output_size of the weights for both the gate and up
+    # layers must be divisible by block_n.
+    # Required by column parallel or enabling merged weights
+    if intermediate_size_per_partition % block_n != 0:
+        raise ValueError(
+            f"The output_size of gate's and up's weight = "
+            f"{intermediate_size_per_partition} is not divisible by "
+            f"weight quantization block_n = {block_n}."
+        )
+
+    # Required by row parallel (down projection)
+    if tp_size > 1 and intermediate_size_per_partition % block_k != 0:
+        raise ValueError(
+            f"The input_size of down's weight = "
+            f"{intermediate_size_per_partition} is not divisible by "
+            f"weight quantization block_k = {block_k}."
         )
 
 
@@ -278,27 +326,14 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
             assert self.weight_block_size is not None
             layer.weight_block_size = self.weight_block_size
             tp_size = get_tensor_model_parallel_world_size()
-            block_n, block_k = (
-                self.weight_block_size[0],
-                self.weight_block_size[1],
+
+            # Validate block sizes for MoE weights
+            validate_moe_block_sizes(
+                intermediate_size_per_partition=intermediate_size_per_partition,
+                hidden_size=hidden_size,
+                weight_block_size=self.weight_block_size,
+                tp_size=tp_size,
             )
-            # NOTE: To ensure proper alignment of the block-wise quantization
-            # scales, the output_size of the weights for both the gate and up
-            # layers must be divisible by block_n.
-            # Required by column parallel or enabling merged weights
-            if tp_size > 1 and intermediate_size_per_partition % block_n != 0:
-                raise ValueError(
-                    f"The output_size of gate's and up's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_n = {block_n}."
-                )
-            if tp_size > 1 and intermediate_size_per_partition % block_k != 0:
-                # Required by row parallel
-                raise ValueError(
-                    f"The input_size of down's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_k = {block_k}."
-                )
         numu_shards = 2 if self.moe.is_act_and_mul else 1
 
         intermediate_size_per_partition = (
@@ -337,7 +372,7 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 numu_shards * intermediate_size_per_partition,
                 hidden_size // 32,
-                dtype=torch.uint8,
+                dtype=MXFP8_SCALE_DTYPE,
             ),
             requires_grad=False,
         )
@@ -349,12 +384,14 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
                 # get_tensor_model_parallel_world_size()
                 # * intermediate_size_per_partition
                 intermediate_size_per_partition // 32,
-                dtype=torch.uint8,
+                dtype=MXFP8_SCALE_DTYPE,
             ),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
+
+        # TODO: check
         quant_method = FusedMoeWeightScaleSupported.BLOCK.value
 
         assert quant_method is not None, "quant_method should be set"

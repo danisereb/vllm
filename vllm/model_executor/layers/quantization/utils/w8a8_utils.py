@@ -11,6 +11,7 @@ from vllm import envs
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    dequant_mxfp8_to_bf16,
     mxfp8_e4m3_quantize,
     mxfp8_e4m3_quantize_python,
 )
@@ -545,25 +546,17 @@ class Mxfp8LinearOp:
     def _apply_flashinfer(
         self,
         input: torch.Tensor,
+        input_scales: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
         out_dtype: torch.dtype,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # From bf16 to mxfp8
-        swizzled = True
-        # q_input, input_scales = mxfp8_e4m3_quantize(input, swizzled)
-        q_input, input_scales = torch.ops.vllm.mxfp8_quantize(input, swizzled)
-
-        # Weights should be mxfp8
-        assert q_input.dtype == weight.dtype
-        assert input_scales.dtype == weight_scale.dtype
-
         input_was_2d = False
-        if q_input.ndim == 2:
+        if input.ndim == 2:
             input_was_2d = True
             # bmm_mxfp8 requires 3D shape
-            q_input = q_input.unsqueeze(0)
+            input = input.unsqueeze(0)
             input_scales = input_scales.unsqueeze(0)
 
         if weight.ndim == 2:
@@ -573,7 +566,7 @@ class Mxfp8LinearOp:
 
         # Use bmm-mxfp8 from flashinfer
         output = torch.ops.vllm.bmm_mxfp8(
-            A=q_input,  # Shape: [b, m, k]
+            A=input,  # Shape: [b, m, k]
             B=weight.transpose(-2, -1),  # Shape: [b, k, n]
             A_scale=input_scales,
             B_scale=weight_scale,
@@ -595,11 +588,31 @@ class Mxfp8LinearOp:
         out_dtype: torch.dtype,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Apply linear layer in fake MXFP8 with block-wise matmul and dequantization.
-        """
+        # Weights should be mxfp8
+        assert weight.dtype == torch.float8_e4m3fn
+        assert weight_scale.dtype == torch.uint8
+
+        assert out_dtype == torch.bfloat16, "Only bfloat16 is supported as out_dtype"
+
+        # From bf16 to mxfp8
+        assert input.dtype == torch.bfloat16
+        swizzled = True
+        input_mxfp8, input_mxfp8_scales = torch.ops.vllm.mxfp8_quantize(input, swizzled)
+
+        assert input_mxfp8.dtype == weight.dtype
+        assert input_mxfp8_scales.dtype == weight_scale.dtype
 
         if self.preferred_backend == "flashinfer":
-            return self._apply_flashinfer(input, weight, weight_scale, out_dtype, bias)
+            return self._apply_flashinfer(
+                input=input_mxfp8,
+                input_scales=input_mxfp8_scales,
+                weight=weight,
+                weight_scale=weight_scale,
+                out_dtype=out_dtype,
+                bias=bias,
+            )
 
-        return input.to(torch.bfloat16) @ weight.T.to(torch.bfloat16)
+        input_bf16 = dequant_mxfp8_to_bf16(input, input_mxfp8_scales)
+        weight_bf16 = dequant_mxfp8_to_bf16(weight, weight_scale)
+
+        return input_bf16 @ weight_bf16.T
