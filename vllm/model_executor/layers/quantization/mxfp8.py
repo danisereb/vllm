@@ -116,8 +116,7 @@ class Mxfp8Config(QuantizationConfig):
                 scope="local",
             )
 
-        # TODO: return None?
-        return UnquantizedLinearMethod
+        return None
 
 
 class Mxfp8LinearMethod(LinearMethodBase):
@@ -192,6 +191,22 @@ class Mxfp8LinearMethod(LinearMethodBase):
 
         if layer.weight_scale.dtype != MXFP8_SCALE_DTYPE:
             raise ValueError("MXFP8 weight_scale must be in uint8 format (E8M0)")
+
+        # Pre-process weight_scale for torch._scaled_mm (Mxfp8LinearOp):
+        # 1. Pad output dimension (N) to multiples of 128
+        # 2. Convert to float8_e8m0fnu format
+        # 3. Flatten to 1D
+        # This is done once here with concrete values, not during inference
+        weight_scale = layer.weight_scale
+        out_features = layer.weight.size(0)
+        out_features_padded = (out_features + 127) // 128 * 128
+        pad_rows = out_features_padded - out_features
+        if pad_rows > 0:
+            # weight_scale is [N, K/32], pad to [N_padded, K/32]
+            weight_scale = torch.nn.functional.pad(weight_scale, (0, 0, 0, pad_rows))
+        # Convert to float8_e8m0fnu and flatten for torch._scaled_mm
+        weight_scale = weight_scale.to(torch.float8_e8m0fnu).flatten()
+        layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
     def apply(
         self,
