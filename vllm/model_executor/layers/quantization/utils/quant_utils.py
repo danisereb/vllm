@@ -641,7 +641,7 @@ def awq_pack(
 
 def swizzle_blockscale(scale: torch.Tensor) -> torch.Tensor:
     """
-    Pad and block-interleave the FP4 block-scales so that they match the data
+    Pad and block-interleave the FP4 / FP8 block-scales so that they match the data
     layout expected by the CUTLASS / FlashInfer kernels.
 
     Parameters
@@ -653,9 +653,9 @@ def swizzle_blockscale(scale: torch.Tensor) -> torch.Tensor:
     torch.Tensor
         The swizzled tensor with the same logical shape as *scale*.
     """
-    assert scale.dtype == torch.float8_e4m3fn, (
+    assert scale.dtype in [torch.float8_e4m3fn, torch.uint8], (
         "swizzle_blockscale expects the input tensor to be in "
-        "torch.float8_e4m3fn format."
+        "torch.float8_e4m3fn or torch.uint8 format"
     )
 
     scale_ndim = scale.ndim
