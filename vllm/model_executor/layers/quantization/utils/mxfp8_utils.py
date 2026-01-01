@@ -8,6 +8,10 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+# MXFP8 data types
+MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
+MXFP8_SCALE_DTYPE = torch.uint8
+
 
 def mxfp8_e4m3_quantize(
     x: torch.Tensor, is_sf_swizzled_layout: bool = False
@@ -79,7 +83,7 @@ def mxfp8_e4m3_quantize_fake(
     Returns empty tensors with the correct shapes and dtypes.
     """
     # FP8 quantized data has same shape as input
-    fp_data = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    fp_data = torch.empty_like(x, dtype=MXFP8_VALUE_DTYPE)
 
     # Compute scale shape: one scale per block of 32 elements along last dim
     # MXFP8 block size is 32
@@ -93,10 +97,10 @@ def mxfp8_e4m3_quantize_fake(
             M_padded = ((M + 127) // 128) * 128
             K_padded = ((K + 3) // 4) * 4
             scales = torch.empty(
-                (M_padded, K_padded), dtype=torch.uint8, device=x.device
+                (M_padded, K_padded), dtype=MXFP8_SCALE_DTYPE, device=x.device
             )
         else:
-            scales = torch.empty((M, K), dtype=torch.uint8, device=x.device)
+            scales = torch.empty((M, K), dtype=MXFP8_SCALE_DTYPE, device=x.device)
     elif x.ndim == 3:
         B, M, N = x.shape
         K = (N + block_size - 1) // block_size
@@ -104,15 +108,15 @@ def mxfp8_e4m3_quantize_fake(
             M_padded = ((M + 127) // 128) * 128
             K_padded = ((K + 3) // 4) * 4
             scales = torch.empty(
-                (B, M_padded, K_padded), dtype=torch.uint8, device=x.device
+                (B, M_padded, K_padded), dtype=MXFP8_SCALE_DTYPE, device=x.device
             )
         else:
-            scales = torch.empty((B, M, K), dtype=torch.uint8, device=x.device)
+            scales = torch.empty((B, M, K), dtype=MXFP8_SCALE_DTYPE, device=x.device)
     else:
         # Fallback for other dimensions
         scale_shape = list(x.shape)
         scale_shape[-1] = (x.shape[-1] + block_size - 1) // block_size
-        scales = torch.empty(scale_shape, dtype=torch.uint8, device=x.device)
+        scales = torch.empty(scale_shape, dtype=MXFP8_SCALE_DTYPE, device=x.device)
 
     return fp_data, scales
 
@@ -138,7 +142,7 @@ class Mxfp8LinearOp:
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Weights should be mxfp8, weight_scale is pre-processed to float8_e8m0fnu
-        assert weight.dtype == torch.float8_e4m3fn
+        assert weight.dtype == MXFP8_VALUE_DTYPE
         assert weight_scale.dtype == torch.float8_e8m0fnu
 
         assert out_dtype == torch.bfloat16, "Only bfloat16 is supported as out_dtype"

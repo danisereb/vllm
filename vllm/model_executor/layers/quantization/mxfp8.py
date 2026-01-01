@@ -29,6 +29,8 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_SCALE_DTYPE,
+    MXFP8_VALUE_DTYPE,
     Mxfp8LinearOp,
     dequant_mxfp8_to_bf16,
 )
@@ -41,10 +43,6 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
-
-
-MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
-MXFP8_SCALE_DTYPE = torch.uint8
 
 
 class Mxfp8Config(QuantizationConfig):
