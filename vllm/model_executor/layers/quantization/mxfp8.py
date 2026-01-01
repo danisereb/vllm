@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from enum import Enum
 from math import ceil
 from typing import Any, Optional
 
 import torch
 
-from vllm import _custom_ops as ops
 from vllm.attention.layer import Attention
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -30,11 +28,6 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
-    FlashinferMoeBackend,
-    register_moe_scaling_factors,
-    swap_w13_to_w31,
-)
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     Mxfp8LinearOp,
     dequant_mxfp8_to_bf16,
@@ -46,7 +39,6 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.utils.math_utils import round_up
 
 logger = init_logger(__name__)
 
@@ -55,95 +47,11 @@ MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 
 
-class Mxfp8MoeBackend(Enum):
-    NONE = 0
-    FLASHINFER_TRTLLM = 1
-
-
-# TODO: use function from here?
-# vllm.model_executor.layers.quantization.utils.flashinfer_utils
-def rotate_flashinfer_fp8_moe_weights(
-    gemm1_weights: torch.Tensor, gemm2_weights: torch.Tensor, gemm1_scales, gemm2_scales
-):
-    # TODO: Hack for mxfp8
-    from flashinfer import (
-        shuffle_matrix_a,
-        shuffle_matrix_sf_a,
-    )
-
-    epilogue_tile_m = 128
-    num_experts = gemm1_weights.shape[0]
-    # hidden_size = gemm1_weights.shape[-1]
-    # intermediate_size = gemm1_weights.shape[1] // 2
-
-    # Reorder rows of W1 for fused gated activation
-    # gemm1_weights_fp8_interleaved = []
-    # for i in range(num_experts):
-    #     gemm1_weights_fp8_interleaved.append(
-    #         reorder_rows_for_gated_act_gemm(gemm1_weights[i])
-    #     )
-
-    # Stack weights and scales for all experts
-    # gemm1_weights_fp8_interleaved = \
-    # torch.stack(gemm1_weights_fp8_interleaved).reshape(
-    #     num_experts, 2 * intermediate_size, hidden_size
-    # )
-    gemm1_weights_fp8_interleaved = gemm1_weights
-
-    # Shuffle weights and scaling factors for transposed mma output
-    gemm1_weights_fp8_shuffled = []
-    gemm2_weights_fp8_shuffled = []
-    gemm1_scales_shuffled = []
-    gemm2_scales_shuffled = []
-    for i in range(num_experts):
-        gemm1_weights_fp8_shuffled.append(
-            shuffle_matrix_a(gemm1_weights_fp8_interleaved[i], epilogue_tile_m)
-            # gemm1_weights_fp8_interleaved[i]
-        )
-
-        gemm1_scales_shuffled.append(
-            shuffle_matrix_sf_a(gemm1_scales[i], 128).contiguous()
-        )
-
-        gemm2_weights_fp8_shuffled.append(
-            shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), epilogue_tile_m)
-            # gemm2_weights[i]
-        )
-        gemm2_scales_shuffled.append(
-            shuffle_matrix_sf_a(gemm2_scales[i], 128).contiguous()
-        )
-
-    # Stack weights for all experts
-    return (
-        torch.stack(gemm1_weights_fp8_shuffled),
-        torch.stack(gemm2_weights_fp8_shuffled).view(torch.float8_e4m3fn),
-        torch.stack(gemm1_scales_shuffled),
-        torch.stack(gemm2_scales_shuffled),
-    )
-    # gemm1_weights.data =
-    # gemm2_weights.data = \
-    # torch.stack(gemm2_weights_fp8_shuffled).view(torch.float8_e4m3fn)
-
-    # gemm1_scales.data = torch.stack(gemm1_scales_shuffled)
-    # gemm2_scales.data = torch.stack(gemm2_scales_shuffled)
-
-
-def pad_to(t: torch.Tensor, dim: int, pad_to: int) -> torch.Tensor:
-    prev_shape = list(t.shape)
-    prev_shape[dim] = pad_to
-    padded_t = t.new_zeros(*prev_shape)
-    if dim == 2:
-        padded_t[:, :, : t.shape[dim]] = t
-    elif dim == 1:
-        padded_t[:, : t.shape[dim], :] = t
-    else:
-        raise ValueError()
-    return padded_t
-
-
 class Mxfp8Config(QuantizationConfig):
     """
-    Example config:
+    Config class for MXFP8.
+
+    Example config for MXFP8 quantization (in model's config.json):
     "quantization_config": {
         "quant_method": "mxfp8",
         "ignored_layers": []
@@ -344,14 +252,6 @@ def validate_moe_block_sizes(
         )
 
 
-def per_tensor_dequantize(
-    tensor: torch.Tensor, inv_scale: float | torch.Tensor
-) -> torch.Tensor:
-    fake_qweight = tensor.to(torch.float16)
-    dq_weight = fake_qweight * inv_scale
-    return dq_weight
-
-
 class Mxfp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Mxfp8Config, layer: torch.nn.Module):
         super().__init__(layer.moe_config)
@@ -359,20 +259,6 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.weight_block_size = self.quant_config.weight_block_size
         self.block_quant: bool = self.weight_block_size is not None
-
-        self.mxfp8_backend = Mxfp8MoeBackend.NONE
-
-        self.flashinfer_moe_backend: FlashinferMoeBackend | None = None
-
-        if self.mxfp8_backend == Mxfp8MoeBackend.FLASHINFER_TRTLLM:
-            if not self.moe.is_act_and_mul:
-                logger.info_once(
-                    "Non-gated MoE is not supported for TENSORRT_LLM backend"
-                )
-            else:
-                self.flashinfer_moe_backend = FlashinferMoeBackend.TENSORRT_LLM
-
-        logger.info_once(f"Using Flashinfer MoE backend {self.flashinfer_moe_backend}")
 
     def create_weights(
         self,
@@ -394,7 +280,7 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
         # Assume MXFP8 weights are FP8 E4M3
         params_dtype = torch.float8_e4m3fn
 
-        if self.block_quant:
+        if self.block_quant:  # TODO: always true?
             assert self.weight_block_size is not None
             layer.weight_block_size = self.weight_block_size
             tp_size = get_tensor_model_parallel_world_size()
@@ -413,7 +299,8 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition
             )
         )
-        # WEIGHTS
+
+        # MXFP8 weights
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
@@ -466,7 +353,6 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
         # TODO: check if this is what we want for MXFP8
         quant_method = FusedMoeWeightScaleSupported.BLOCK.value
 
-        assert quant_method is not None, "quant_method should be set"
         extra_weight_attrs.update({"quant_method": quant_method})
 
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
@@ -483,8 +369,8 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
         self, intermediate_size_per_partition: int
     ) -> int:
         # For MXFP8, we need to pad the weight
-        # tensors to be deivisible by tp_size * 32
-        divisible_by = 32
+        # tensors to be divisible by tp_size * 32
+        divisible_by = 32  # TODO: replace 32 with variable
         if intermediate_size_per_partition % divisible_by != 0:
             increase = divisible_by - intermediate_size_per_partition % divisible_by
             logger.debug_once(
@@ -495,22 +381,18 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
             intermediate_size_per_partition += increase
         return intermediate_size_per_partition
 
-    def _process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # -------------------------
-        # w13 processing
-        # -------------------------
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # De-quantize w13 weight and scale
         w13_q, w13_scale = layer.w13_weight, layer.w13_weight_scale
 
         dq_w13 = dequant_mxfp8_to_bf16(w13_q, w13_scale).contiguous()
         layer.w13_weight = torch.nn.Parameter(dq_w13.data, requires_grad=False)
 
-        # -------------------------
-        # w2 processing
-        # -------------------------
+        # De-quantize w2 weight and scale
         w2_q, w2_scale_full = layer.w2_weight, layer.w2_weight_scale
 
         # Select expert block
-        blk = ceil(w2_q.shape[-1] / 32)
+        blk = ceil(w2_q.shape[-1] / 32)  # TODO: replace 32 with variable
         start = layer.ep_rank * blk
         end = (layer.ep_rank + 1) * blk
         w2_scale = w2_scale_full[..., start:end]
@@ -518,106 +400,9 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
         dq_w2 = dequant_mxfp8_to_bf16(w2_q, w2_scale).contiguous()
         layer.w2_weight = torch.nn.Parameter(dq_w2.data, requires_grad=False)
 
-    def _process_weights_after_loading_flashinfer(self, layer: torch.nn.Module) -> None:
-        # Pad weights
-        layer.intermediate_size_per_partition = round_up(
-            layer.intermediate_size_per_partition, 128
-        )
-        layer.w13_weight = torch.nn.Parameter(
-            pad_to(
-                layer.w13_weight, 1, layer.intermediate_size_per_partition
-            ).contiguous(),
-            requires_grad=False,
-        )
-        layer.w13_weight_scale = torch.nn.Parameter(
-            pad_to(
-                layer.w13_weight_scale,
-                1,
-                layer.intermediate_size_per_partition,
-            )
-            .to(dtype=MXFP8_SCALE_DTYPE)
-            .contiguous(),
-            requires_grad=False,
-        )
-        layer.w2_weight = torch.nn.Parameter(
-            pad_to(
-                layer.w2_weight, 2, layer.intermediate_size_per_partition
-            ).contiguous(),
-            requires_grad=False,
-        )
-        layer.w2_weight_scale = torch.nn.Parameter(
-            pad_to(
-                layer.w2_weight_scale,
-                2,
-                layer.intermediate_size_per_partition // 32,
-            )
-            .to(dtype=MXFP8_SCALE_DTYPE)
-            .contiguous(),
-            requires_grad=False,
-        )
-
-        gemm1_w, gemm2_w, gemm1_s, gemm2_s = rotate_flashinfer_fp8_moe_weights(
-            layer.w13_weight,
-            layer.w2_weight,
-            layer.w13_weight_scale.to(dtype=MXFP8_SCALE_DTYPE),
-            layer.w2_weight_scale.to(dtype=MXFP8_SCALE_DTYPE),
-        )
-        layer.w13_weight_shuffled = torch.nn.Parameter(gemm1_w, requires_grad=False)
-        layer.w2_weight_shuffled = torch.nn.Parameter(gemm2_w, requires_grad=False)
-        layer.w13_scales_shuffled = torch.nn.Parameter(gemm1_s, requires_grad=False)
-        layer.w2_scales_shuffled = torch.nn.Parameter(gemm2_s, requires_grad=False)
-
-        # TODO: needed?
-        # del layer.w13_weight
-        # del layer.w2_weight
-        # del layer.w13_weight_scale
-        # del layer.w2_weight_scale
-
-        # Dequant
-        assert layer.w13_weight_scale is not None
-        shard_size = layer.intermediate_size_per_partition
-        max_w13_scales = layer.w13_weight_scale.max(dim=1).values
-        for expert_id in range(layer.local_num_experts):
-            start = 0
-            for shard_id in range(2):
-                dq_weight = per_tensor_dequantize(
-                    layer.w13_weight[expert_id][start : start + shard_size, :],
-                    layer.w13_weight_scale[expert_id][shard_id],
-                )
-                layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
-                    ops.scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
-                )
-                start += shard_size
-
-        layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
-
-        if self.flashinfer_moe_backend is not None:
-            # NOTE: weights have to be swapped since the activation is
-            # applied on different half for flashinfer vs vllm
-            assert not self.block_quant
-            register_moe_scaling_factors(layer)
-            w13_weight = swap_w13_to_w31(layer.w13_weight.data)
-            # TODO: hack to avoid ruff
-            # if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
-            #     rotate_flashinfer_fp8_moe_weights(w13_weight, w2_weight)
-            layer.w13_weight.data = w13_weight.data
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self.flashinfer_moe_backend is not None:
-            assert self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM
-            self._process_weights_after_loading_flashinfer(layer)
-        else:
-            self._process_weights_after_loading(layer)
-
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
-            return mxfp8_fake_w8a8_moe_quant_config(
-                w1_scale=layer.w13_weight_shuffled,
-                w2_scale=layer.w2_weight_shuffled,
-            )
-
         return mxfp8_fake_w8a8_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
