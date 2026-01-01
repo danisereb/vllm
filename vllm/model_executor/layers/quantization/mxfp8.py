@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from functools import partial
+
+from enum import Enum
 from math import ceil
 from typing import Any, Optional
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.attention.layer import Attention
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -15,7 +17,6 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
 )
 from vllm.model_executor.layers.fused_moe.config import (
-    FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     mxfp8_fake_w8a8_moe_quant_config,
 )
@@ -29,13 +30,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.fp8 import (
-    Fp8MoeBackend,
-    get_fp8_moe_backend,
-)
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     FlashinferMoeBackend,
-    flashinfer_cutlass_moe_fp8,
+    register_moe_scaling_factors,
+    swap_w13_to_w31,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     Mxfp8LinearOp,
@@ -55,6 +53,11 @@ logger = init_logger(__name__)
 
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
+
+
+class Mxfp8MoeBackend(Enum):
+    NONE = 0
+    FLASHINFER_TRTLLM = 1
 
 
 # TODO: use function from here?
@@ -341,6 +344,14 @@ def validate_moe_block_sizes(
         )
 
 
+def per_tensor_dequantize(
+    tensor: torch.Tensor, inv_scale: float | torch.Tensor
+) -> torch.Tensor:
+    fake_qweight = tensor.to(torch.float16)
+    dq_weight = fake_qweight * inv_scale
+    return dq_weight
+
+
 class Mxfp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Mxfp8Config, layer: torch.nn.Module):
         super().__init__(layer.moe_config)
@@ -349,41 +360,19 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.block_quant: bool = self.weight_block_size is not None
 
-        moe_parallel_config: FusedMoEParallelConfig = layer.moe_parallel_config
-        with_lora_support = False
-        self.fp8_backend = get_fp8_moe_backend(
-            block_quant=self.block_quant,
-            moe_parallel_config=moe_parallel_config,
-            with_lora_support=with_lora_support,
-        )
+        self.mxfp8_backend = Mxfp8MoeBackend.NONE
 
-        self.use_marlin = self.fp8_backend == Fp8MoeBackend.MARLIN
         self.flashinfer_moe_backend: FlashinferMoeBackend | None = None
-        if self.fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM:
+
+        if self.mxfp8_backend == Mxfp8MoeBackend.FLASHINFER_TRTLLM:
             if not self.moe.is_act_and_mul:
                 logger.info_once(
-                    "Non-gated MoE is not supported for TENSORRT_LLM backend, "
-                    "falling back to CUTLASS backend"
+                    "Non-gated MoE is not supported for TENSORRT_LLM backend"
                 )
-                self.flashinfer_moe_backend = FlashinferMoeBackend.CUTLASS
             else:
                 self.flashinfer_moe_backend = FlashinferMoeBackend.TENSORRT_LLM
-        elif self.fp8_backend == Fp8MoeBackend.FLASHINFER_CUTLASS:
-            self.flashinfer_moe_backend = FlashinferMoeBackend.CUTLASS
-            if self.block_quant:
-                assert self.weight_block_size == [128, 128], (
-                    f"Only support weight_block_size == [128, 128], "
-                    f"got {self.weight_block_size}"
-                )
-            self.flashinfer_moe_fn = partial(
-                flashinfer_cutlass_moe_fp8,
-                moe=self.moe,
-                use_deepseek_fp8_block_scale=self.block_quant,
-            )
 
         logger.info_once(f"Using Flashinfer MoE backend {self.flashinfer_moe_backend}")
-
-        self.allow_deep_gemm = self.fp8_backend == Fp8MoeBackend.DEEPGEMM
 
     def create_weights(
         self,
@@ -454,7 +443,7 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
             torch.ones(
                 num_experts,
                 numu_shards * intermediate_size_per_partition,
-                hidden_size // 32,
+                hidden_size // 32,  # TODO: replace 32 with variable
                 dtype=MXFP8_SCALE_DTYPE,
             ),
             requires_grad=False,
@@ -466,7 +455,7 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 # get_tensor_model_parallel_world_size()
                 # * intermediate_size_per_partition
-                intermediate_size_per_partition // 32,
+                intermediate_size_per_partition // 32,  # TODO: replace 32 with variable
                 dtype=MXFP8_SCALE_DTYPE,
             ),
             requires_grad=False,
@@ -474,11 +463,14 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        # TODO: check
+        # TODO: check if this is what we want for MXFP8
         quant_method = FusedMoeWeightScaleSupported.BLOCK.value
 
         assert quant_method is not None, "quant_method should be set"
         extra_weight_attrs.update({"quant_method": quant_method})
+
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         set_weight_attrs(w13_weight, {"quant_method": quant_method})
         set_weight_attrs(w2_weight, {"quant_method": quant_method})
@@ -574,15 +566,45 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_shuffled = torch.nn.Parameter(gemm2_w, requires_grad=False)
         layer.w13_scales_shuffled = torch.nn.Parameter(gemm1_s, requires_grad=False)
         layer.w2_scales_shuffled = torch.nn.Parameter(gemm2_s, requires_grad=False)
-        del layer.w13_weight
-        del layer.w2_weight
-        del layer.w13_weight_scale
-        del layer.w2_weight_scale
+
+        # TODO: needed?
+        # del layer.w13_weight
+        # del layer.w2_weight
+        # del layer.w13_weight_scale
+        # del layer.w2_weight_scale
+
+        # Dequant
+        assert layer.w13_weight_scale is not None
+        shard_size = layer.intermediate_size_per_partition
+        max_w13_scales = layer.w13_weight_scale.max(dim=1).values
+        for expert_id in range(layer.local_num_experts):
+            start = 0
+            for shard_id in range(2):
+                dq_weight = per_tensor_dequantize(
+                    layer.w13_weight[expert_id][start : start + shard_size, :],
+                    layer.w13_weight_scale[expert_id][shard_id],
+                )
+                layer.w13_weight[expert_id][start : start + shard_size, :], _ = (
+                    ops.scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+                )
+                start += shard_size
+
+        layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
+
+        if self.flashinfer_moe_backend is not None:
+            # NOTE: weights have to be swapped since the activation is
+            # applied on different half for flashinfer vs vllm
+            assert not self.block_quant
+            register_moe_scaling_factors(layer)
+            w13_weight = swap_w13_to_w31(layer.w13_weight.data)
+            # TODO: hack to avoid ruff
+            # if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
+            #     rotate_flashinfer_fp8_moe_weights(w13_weight, w2_weight)
+            layer.w13_weight.data = w13_weight.data
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.flashinfer_moe_backend is not None:
-            # TODO:
-            # assert self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM
+            assert self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM
             self._process_weights_after_loading_flashinfer(layer)
         else:
             self._process_weights_after_loading(layer)
@@ -590,9 +612,6 @@ class Mxfp8MoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        if self.use_marlin:
-            return None
-
         if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
             return mxfp8_fake_w8a8_moe_quant_config(
                 w1_scale=layer.w13_weight_shuffled,
