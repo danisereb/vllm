@@ -856,6 +856,10 @@ class ModelConfig:
                         quant_cfg["quant_method"] = "modelopt"
                     elif quant_algo_upper == "NVFP4":
                         quant_cfg["quant_method"] = "modelopt_fp4"
+                    elif quant_algo_upper == "MXFP8":
+                        # No quantization_config in config.json
+                        # Use quant_algo from hf_quant_config.json
+                        quant_cfg["quant_method"] = "modelopt_mxfp8"
                     else:
                         raise ValueError(f"Unknown ModelOpt quant algo: {quant_algo}")
 
@@ -898,6 +902,7 @@ class ModelConfig:
                 "moe_wna16",
                 "modelopt",
                 "modelopt_fp4",
+                "modelopt_mxfp8",
                 "petit_nvfp4",
                 # Ensure heavy backends are probed last to avoid unnecessary
                 # imports during override detection (e.g., MXFP4 imports Triton)
