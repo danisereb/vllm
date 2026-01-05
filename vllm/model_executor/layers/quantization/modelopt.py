@@ -1992,24 +1992,6 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
         return 100
 
     @classmethod
-    def override_quantization_method(
-        cls, hf_quant_cfg, user_quant
-    ) -> QuantizationMethods | None:
-        """Detect if this ModelOpt MXFP8 config should be used based on
-        quantization config."""
-        if hf_quant_cfg is None:
-            return None
-
-        # Use the community standard 'quant_method'
-        quant_method = hf_quant_cfg.get("quant_method", "").lower()
-
-        # Only proceed if the method is explicitly "modelopt"
-        if quant_method != "modelopt":
-            return None
-
-        return None
-
-    @classmethod
     def _from_config(
         cls,
         *,
@@ -2050,9 +2032,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
         self.quant_config = quant_config
 
         if not self.quant_config.is_checkpoint_fp8_serialized:
-            raise ValueError(
-                "FP8_PB_WO currently only supports FP8-serialized checkpoints."
-            )
+            raise ValueError("MXFP8 currently only supports serialized checkpoints.")
 
         self.backend: str = "torch"  # torch._scaled_mm is used by default
         self.mxfp8_linear = Mxfp8LinearOp()
@@ -2144,12 +2124,10 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
     def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-        out_dtype: torch.dtype = torch.bfloat16,
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
+        out_dtype: torch.dtype = torch.bfloat16
+
         return self.mxfp8_linear.apply(
             input=x,
             weight=layer.weight,
@@ -2161,9 +2139,9 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
 
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
     """
-    MoE Method for FP4 Quantization.
+    MoE Method for MXFP8 Quantization.
     Args:
-        quant_config: NVFP4 Quant Config
+        quant_config: MXFP8 Quant Config
     """
 
     def __init__(
@@ -2177,22 +2155,6 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
 
         self.weight_block_size = [1, self.quant_config.group_size]
         self.block_k = self.weight_block_size[1]
-
-    def select_gemm_impl(
-        self,
-        prepare_finalize: mk.FusedMoEPrepareAndFinalize,
-        layer: torch.nn.Module,
-    ) -> mk.FusedMoEPermuteExpertsUnpermute:
-        assert self.moe_quant_config is not None
-
-        # Using bfloat16 for the output dtype
-        out_dtype = torch.bfloat16
-
-        experts = select_cutlass_fp8_gemm_impl(
-            self.moe, self.moe_quant_config, out_dtype=out_dtype
-        )
-        logger.debug_once("Using %s", experts.__class__.__name__)
-        return experts
 
     def create_weights(
         self,
@@ -2293,33 +2255,15 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         dq_w2 = dequant_mxfp8_to_bf16(w2_q, w2_scale).contiguous()
         layer.w2_weight = torch.nn.Parameter(dq_w2.data, requires_grad=False)
 
-    def prepare_dp_allgather_tensor(
-        self,
-        layer: FusedMoE,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Optionally prepare extra tensors to carry through DP allgather/EP."""
-        import flashinfer
-
-        a1_gscale = layer.w13_input_scale_quant
-        hidden_states_fp4, hidden_states_sf = flashinfer.fp4_quantize(
-            hidden_states,
-            a1_gscale,
-            is_sf_swizzled_layout=False,
-        )
-        extra_tensors: list[torch.Tensor] = [hidden_states_sf]
-        return hidden_states_fp4, extra_tensors
-
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        # TODO: check
+        # TODO: check, maybe remove this method
         return None
 
     @property
     def supports_eplb(self) -> bool:
-        # TODO: never tested
+        # TODO: return False, never tested
         return False
 
     def apply(
