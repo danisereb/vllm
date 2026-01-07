@@ -405,6 +405,7 @@ class LoRAModelManager:
                     "LoRA is not supported for non-gated MoE gate module."
                     " %s will be ignored.",
                     module_name,
+                    scope="local",
                 )
                 continue
 
