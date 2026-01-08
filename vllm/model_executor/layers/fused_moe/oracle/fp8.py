@@ -80,17 +80,18 @@ def select_fp8_moe_backend(
         and has_flashinfer_moe()
     ):
         backend = get_flashinfer_moe_backend()
-        if backend == FlashinferMoeBackend.TENSORRT_LLM:
+        if backend == FlashinferMoeBackend.TENSORRT_LLM and is_act_and_mul:
             logger.info_once(_make_log_backend("FlashInfer TRTLLM"))
-            if not is_act_and_mul:
-                raise ValueError(
-                    "FlashInfer TRTLLM FP8 MoE backend only supports "
-                    "act_and_mul gate_up_project fusion. Please set "
-                    "VLLM_USE_FLASHINFER_MOE_FP8=throughput to use the "
-                    "FlashInfer CUTLASS backend instead."
-                )
             return Fp8MoeBackend.FLASHINFER_TRTLLM
         else:
+            if backend == FlashinferMoeBackend.TENSORRT_LLM:
+                # TRTLLM only supports act_and_mul gate_up_project fusion,
+                # so fall back to CUTLASS for non-gated MoE.
+                logger.info_once(
+                    "FlashInfer TRTLLM FP8 MoE backend only supports "
+                    "act_and_mul gate_up_project fusion. Falling back to "
+                    "FlashInfer CUTLASS backend."
+                )
             if block_quant and current_platform.is_device_capability_family(100):
                 raise ValueError(
                     "FlashInfer FP8 MoE throughput backend does not "
