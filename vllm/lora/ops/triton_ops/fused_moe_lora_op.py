@@ -10,8 +10,6 @@ from vllm.distributed import (
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import supports_pdl
-
 _LORA_PTR_DICT: dict[tuple[int, ...], torch.tensor] = {}
 
 
@@ -466,7 +464,10 @@ def _fused_moe_lora(
         dtype=output.dtype,
         device=device,
     )
-    use_gdc = supports_pdl(device) and not fully_sharded
+    # Disable GDC for fused MoE LoRA kernels as Triton's pipeliner cannot
+    # handle gdc_wait() inside loops, causing compilation errors like:
+    # "pipeliner doesn't know how to predicate this op"
+    use_gdc = False
     _fused_moe_lora_shrink(
         a_intermediate_cache1,
         qcurr_hidden_states,
