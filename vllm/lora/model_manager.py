@@ -507,6 +507,21 @@ class LoRAModelManager:
                     )
                     subloras.append(lora)
                 if module.__class__.__name__ == "FusedMoEWithLoRA":
+                    # For non-gated MoE, pad subloras to 3 elements per expert
+                    # to match pack_moe expectations (w1, w2, None for w3)
+                    if (
+                        self._is_non_gated_moe
+                        and len(subloras) > 0
+                        and len(subloras) % 3 != 0
+                    ):
+                        assert len(subloras) % 2 == 0, (
+                            "Expected pairs of LoRA weights for non-gated MoE."
+                        )
+                        padded_subloras: list[LoRALayerWeights | None] = []
+                        for i in range(0, len(subloras), 2):
+                            padded_subloras.extend(subloras[i : i + 2])
+                            padded_subloras.append(None)
+                        subloras = padded_subloras
                     lora = PackedLoRALayerWeights.pack_moe(
                         subloras, module_name, is_non_gated_moe=self._is_non_gated_moe
                     )
