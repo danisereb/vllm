@@ -85,15 +85,13 @@ class LoRAModel:
         skip_prefixes: list[str] | None = None,
     ) -> "LoRAModel":
         """Create a LoRAModel from a dictionary of tensors."""
-        if skip_prefixes is None:
-            skip_prefixes = []
         pin_memory = str(device) == "cpu" and is_pin_memory_available()
         loras: dict[str, LoRALayerWeights] = {}
         for tensor_name, tensor in tensors.items():
             if is_base_embeddding_weights(tensor_name):
                 continue
             # Skip modules based on model-defined prefixes (e.g., MTP layers)
-            if cls._should_skip_module(tensor_name, skip_prefixes):
+            if skip_prefixes and cls._should_skip_module(tensor_name, skip_prefixes):
                 continue
             module_name, is_lora_a = parse_fine_tuned_lora_name(
                 tensor_name, weights_mapper
@@ -157,8 +155,6 @@ class LoRAModel:
         Returns:
             Loaded LoRA Model.
         """
-        if skip_prefixes is None:
-            skip_prefixes = []
         lora_tensor_path = os.path.join(lora_dir, "adapter_model.safetensors")
         lora_bin_file_path = os.path.join(lora_dir, "adapter_model.bin")
         lora_pt_file_path = os.path.join(lora_dir, "adapter_model.pt")
@@ -175,7 +171,9 @@ class LoRAModel:
                 if "base_layer" in lora_module:
                     continue
                 # Skip modules based on model-defined prefixes
-                if cls._should_skip_module(lora_module, skip_prefixes):
+                if skip_prefixes and cls._should_skip_module(
+                    lora_module, skip_prefixes
+                ):
                     continue
                 module_name, _ = parse_fine_tuned_lora_name(lora_module, weights_mapper)
                 # Case for expert lora weights
