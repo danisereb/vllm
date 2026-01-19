@@ -335,7 +335,7 @@ def _mxfp8_dequant_gemm_kernel(
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,  # Must be 32 to match MXFP8_BLOCK_SIZE
+    BLOCK_SIZE_K: tl.constexpr,  # Can be 32, 64, 128 (must be multiple of 32)
     GROUP_SIZE_M: tl.constexpr,
 ):
     """
@@ -347,7 +347,13 @@ def _mxfp8_dequant_gemm_kernel(
     - C is [M, N] output in bfloat16
 
     This kernel dequantizes weights on-the-fly, avoiding input quantization.
+    Supports BLOCK_SIZE_K as any multiple of 32 (32, 64, 128, etc.)
     """
+    # MXFP8 scale block size (32 elements per scale)
+    SCALE_BLOCK: tl.constexpr = 32
+    # Number of scale groups within each K block
+    NUM_SCALE_GROUPS: tl.constexpr = BLOCK_SIZE_K // SCALE_BLOCK
+
     # Program ID and work distribution
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -377,7 +383,7 @@ def _mxfp8_dequant_gemm_kernel(
     # Accumulator in float32 for numerical accuracy
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    # Main loop over K dimension - unrolled for better pipelining
+    # Main loop over K dimension
     num_k_iters = tl.cdiv(K, BLOCK_SIZE_K)
     for k in range(0, num_k_iters):
         k_start = k * BLOCK_SIZE_K
@@ -389,14 +395,25 @@ def _mxfp8_dequant_gemm_kernel(
         # Load B tile: [BLOCK_SIZE_K, BLOCK_SIZE_N] in fp8
         b_fp8 = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
 
-        # Load weight scales for this K block and convert to bf16
-        # e8m0 format: (val << 7).view(bf16)
-        b_s_uint8 = tl.load(Bs_ptrs + k * stride_Bs_k)
+        # Load weight scales and expand to match B shape
+        # Each scale covers 32 elements along K
+        # offs_k // SCALE_BLOCK gives which scale group each k index belongs to
+        scale_base_idx = k * NUM_SCALE_GROUPS
+        scale_indices = offs_k // SCALE_BLOCK  # [BLOCK_SIZE_K]
+
+        # Load scales for each k position: [BLOCK_SIZE_K, BLOCK_SIZE_N]
+        b_s_uint8 = tl.load(
+            Bs_ptrs[None, :]
+            + scale_indices[:, None] * stride_Bs_k
+            + scale_base_idx * stride_Bs_k
+        )
+        # Convert e8m0 to bf16
         b_s = (b_s_uint8.to(tl.int16) << 7).to(tl.bfloat16, bitcast=True)
 
-        # Dequantize B and compute dot product in one step
-        # b_fp8 is [BLOCK_K, BLOCK_N], b_s is [BLOCK_N]
-        b_bf16 = b_fp8.to(tl.bfloat16) * b_s[None, :]
+        # Dequantize B: [BLOCK_SIZE_K, BLOCK_SIZE_N]
+        b_bf16 = b_fp8.to(tl.bfloat16) * b_s
+
+        # Compute dot product
         accumulator += tl.dot(a, b_bf16, out_dtype=tl.float32)
 
         # Advance pointers
@@ -757,17 +774,72 @@ def mxfp8_dequant_gemm(
     configs = get_mxfp8_dequant_gemm_configs(N, K)
     if configs:
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+        logger.debug("MXFP8 GEMM: M=%d, N=%d, K=%d using tuned config", M, N, K)
     else:
-        # Default configuration optimized for MXFP8 dequant GEMM
-        # BLOCK_SIZE_K must be 32 to match MXFP8 block size
-        config = {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 32,
-            "GROUP_SIZE_M": 8,
-            "num_warps": 8,
-            "num_stages": 3,
-        }
+        # Select config based on matrix dimensions and batch size (M)
+        # Llama-3 70B TP1: hidden=8192, intermediate=28672
+        # Llama-3 70B TP2: hidden=4096, intermediate=14336 per GPU
+        # BLOCK_SIZE_K can be 32, 64, 128 (must be multiple of 32)
+        if M <= 16:
+            # Very small batch (decode) - minimize launch overhead
+            config = {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 2,
+            }
+        elif M <= 64:
+            # Small batch - balance occupancy and work per block
+            config = {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 4,
+                "num_warps": 4,
+                "num_stages": 3,
+            }
+        elif N >= 4096 and K >= 4096:
+            # Large batch + large matrices
+            config = {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "num_warps": 8,
+                "num_stages": 4,
+            }
+        elif N >= 2048 or K >= 2048:
+            # Large batch + medium matrices
+            config = {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "num_warps": 8,
+                "num_stages": 4,
+            }
+        else:
+            # Small matrices - default config
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+                "num_warps": 4,
+                "num_stages": 3,
+            }
+        logger.debug(
+            "MXFP8 GEMM: M=%d, N=%d, K=%d using config BLOCK_M=%d, "
+            "BLOCK_N=%d, BLOCK_K=%d",
+            M,
+            N,
+            K,
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+        )
 
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
@@ -947,11 +1019,12 @@ class Mxfp8LinearOp:
     """
     This class executes a MXFP8 linear layer.
 
-    Supports four backends:
+    Supports three backends:
     - "dot_scaled": Uses tl.dot_scaled for hardware-accelerated MXFP8 (Blackwell)
     - "triton": Uses custom Triton kernel with on-the-fly dequantization
-    - "scaled_mm": Uses torch._scaled_mm (requires hardware support)
     - "fallback": Dequantizes to bf16 and uses standard linear (for debugging)
+
+    Note: torch._scaled_mm does NOT support MXFP8 block scaling format.
     """
 
     def __init__(self, use_fallback: bool = False, backend: str | None = None):
@@ -961,15 +1034,15 @@ class Mxfp8LinearOp:
         Args:
             use_fallback: If True, use fallback (dequantize) mode.
                          Deprecated, use backend="fallback" instead.
-            backend: One of "dot_scaled", "triton", "scaled_mm", or "fallback".
+            backend: One of "dot_scaled", "triton", or "fallback".
                     If None, auto-selects best backend:
                     - "dot_scaled" on Blackwell (sm100+) if supported
                     - "triton" otherwise
         """
         if backend is not None:
-            assert backend in ("dot_scaled", "scaled_mm", "triton", "fallback"), (
+            assert backend in ("dot_scaled", "triton", "fallback"), (
                 f"Unknown backend: {backend}. "
-                "Supported: 'dot_scaled', 'triton', 'scaled_mm', 'fallback'"
+                "Supported: 'dot_scaled', 'triton', 'fallback'"
             )
             self.backend = backend
         elif use_fallback:
@@ -997,10 +1070,8 @@ class Mxfp8LinearOp:
             return self._apply_fallback(input, weight, weight_scale, out_dtype, bias)
         elif self.backend == "dot_scaled":
             return self._apply_dot_scaled(input, weight, weight_scale, out_dtype, bias)
-        elif self.backend == "triton":
+        else:  # triton
             return self._apply_triton(input, weight, weight_scale, out_dtype, bias)
-        else:  # scaled_mm
-            return self._apply_scaled_mm(input, weight, weight_scale, out_dtype, bias)
 
     def _apply_fallback(
         self,
@@ -1139,49 +1210,6 @@ class Mxfp8LinearOp:
 
         # Reshape output to match input batch dimensions
         output = output.view(*input.shape[:-1], out_features)
-
-        if bias is not None:
-            output = output + bias
-
-        return output
-
-    def _apply_scaled_mm(
-        self,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        weight_scale: torch.Tensor,
-        out_dtype: torch.dtype,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # Weights should be mxfp8, weight_scale
-        # is pre-processed to float8_e8m0fnu
-        assert weight.dtype == MXFP8_VALUE_DTYPE
-        # weight_scale is already pre-processed
-        # in process_weights_after_loading
-        assert weight_scale.dtype == torch.float8_e8m0fnu
-
-        assert out_dtype == torch.bfloat16, "Only bfloat16 is supported as out_dtype"
-
-        # From bf16 to mxfp8
-        assert input.dtype == torch.bfloat16
-
-        swizzled = True
-        input_mxfp8, input_mxfp8_scales = torch.ops.vllm.mxfp8_quantize(input, swizzled)
-
-        # For Blockwise 1x32 scaling, a and b should be float8,
-        # scales should be float8_e8m0fnu and 1D contiguous
-        # Use .view() to reinterpret uint8 bytes as float8_e8m0fnu
-        # (not .to() which converts values)
-        input_mxfp8_scales = input_mxfp8_scales.view(torch.float8_e8m0fnu).flatten()
-
-        output = torch._scaled_mm(
-            input_mxfp8,
-            weight.t(),
-            scale_a=input_mxfp8_scales,
-            scale_b=weight_scale,
-            out_dtype=out_dtype,
-            use_fast_accum=True,
-        )
 
         if bias is not None:
             output = output + bias
