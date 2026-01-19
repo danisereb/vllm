@@ -1799,8 +1799,11 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
         if not self.quant_config.is_checkpoint_fp8_serialized:
             raise ValueError("MXFP8 currently only supports serialized checkpoints.")
 
-        self.backend: str = "triton"
-        self.mxfp8_linear = Mxfp8LinearOp(backend=self.backend)
+        # Let Mxfp8LinearOp auto-select the best backend:
+        # - "dot_scaled" on Blackwell (sm100+) for hardware acceleration
+        # - "triton" otherwise
+        self.mxfp8_linear = Mxfp8LinearOp(backend=None)
+        self.backend = self.mxfp8_linear.backend
 
         logger.info_once(f"Using {self.backend} for MXFP8 GEMM")
 
