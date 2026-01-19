@@ -20,8 +20,112 @@ MXFP8_BLOCK_SIZE = 32
 
 
 # ============================================================================
-# Triton Kernel for MXFP8 Block-Scaled Matrix Multiplication
+# Triton Kernels for MXFP8 Block-Scaled Matrix Multiplication
 # ============================================================================
+
+
+@triton.jit
+def _mxfp8_dequant_gemm_kernel(
+    # Pointers to inputs and output
+    A,  # Input activation: [M, K] in bfloat16
+    B,  # Weight: [N, K] in float8_e4m3fn (row-major, will be transposed)
+    C,  # Output: [M, N] in bfloat16
+    Bs,  # Weight scales: [N, K // 32] in uint8 (e8m0 format)
+    # Shape for matmul
+    M,
+    N,
+    K,
+    # Stride for inputs and output
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_Bs_n,
+    stride_Bs_k,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  # Must be 32 to match MXFP8_BLOCK_SIZE
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """
+    Optimized Triton kernel for bf16 input x MXFP8 weight matmul.
+
+    Computes C = A @ B.T where:
+    - A is [M, K] activation in bfloat16 (NO quantization needed!)
+    - B is [N, K] weight in float8_e4m3fn with per-32-element row scales
+    - C is [M, N] output in bfloat16
+
+    This kernel dequantizes weights on-the-fly, avoiding input quantization.
+    """
+    # Program ID and work distribution
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Offsets for the current block
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    # Pointers to A data: A is [M, K], load as [BLOCK_SIZE_M, BLOCK_SIZE_K]
+    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+
+    # Pointers to B data: B is [N, K], but we load as [BLOCK_SIZE_K, BLOCK_SIZE_N]
+    # by swapping the indexing pattern - this avoids needing tl.trans()
+    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    # Pointers to weight scales: [N, K // 32]
+    Bs_ptrs = Bs + offs_bn * stride_Bs_n
+
+    # Accumulator in float32 for numerical accuracy
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Main loop over K dimension
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_start = k * BLOCK_SIZE_K
+
+        # Load A tile: [BLOCK_SIZE_M, BLOCK_SIZE_K] in bf16
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k_start, other=0.0)
+
+        # Load B tile: [BLOCK_SIZE_K, BLOCK_SIZE_N] in fp8
+        b_fp8 = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
+
+        # Load weight scales for this K block
+        offs_ks = k_start // 32
+        b_s_uint8 = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+
+        # Convert e8m0 scale to bf16: (val << 7).view(bf16)
+        b_s = (b_s_uint8.to(tl.int16) << 7).to(tl.bfloat16, bitcast=True)
+
+        # Dequantize B: convert fp8 to bf16 and apply scale
+        # b_fp8 is [BLOCK_K, BLOCK_N], b_s is [BLOCK_N]
+        b_bf16 = b_fp8.to(tl.bfloat16) * b_s[None, :]
+
+        # Compute dot product: [M, K] @ [K, N] = [M, N]
+        accumulator += tl.dot(a, b_bf16, out_dtype=tl.float32)
+
+        # Advance pointers
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Convert accumulator to output dtype and store
+    c = accumulator.to(tl.bfloat16)
+
+    # Store output
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
 
 
 @triton.jit
@@ -50,7 +154,7 @@ def _mxfp8_triton_block_scaled_mm_kernel(
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,  # Should be multiple of 32 (MXFP8_BLOCK_SIZE)
+    BLOCK_SIZE_K: tl.constexpr,  # Must be 32 to match MXFP8_BLOCK_SIZE
     GROUP_SIZE_M: tl.constexpr,
 ):
     """
@@ -80,9 +184,12 @@ def _mxfp8_triton_block_scaled_mm_kernel(
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    # Pointers to A and B data
+    # Pointers to A data: A is [M, K], load as [BLOCK_SIZE_M, BLOCK_SIZE_K]
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B + (offs_bn[:, None] * stride_bn + offs_k[None, :] * stride_bk)
+
+    # Pointers to B data: B is [N, K], but we load as [BLOCK_SIZE_K, BLOCK_SIZE_N]
+    # by swapping the indexing pattern - this avoids needing tl.trans()
+    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     # Pointers to scales (one scale per 32 elements along K)
     # As shape: [M, K // 32], Bs shape: [N, K // 32]
@@ -99,43 +206,27 @@ def _mxfp8_triton_block_scaled_mm_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         k_start = k * BLOCK_SIZE_K
 
-        # Load A and B tiles with masking
+        # Load A tile: [BLOCK_SIZE_M, BLOCK_SIZE_K]
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k_start, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[None, :] < K - k_start, other=0.0)
-
-        # For each MXFP8 group (32 elements) within this K block,
-        # we need to apply the corresponding scale
-        # Since BLOCK_SIZE_K should be a multiple of 32, we process
-        # BLOCK_SIZE_K // 32 scale groups per iteration
+        # Load B tile: [BLOCK_SIZE_K, BLOCK_SIZE_N] - ready for dot, no transpose
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
 
         # Scale offset for this K block
         offs_ks = k_start // MXFP8_GROUP_K
 
-        # Load scales as uint8 and convert to bfloat16
-        # e8m0 format: exponent only, convert via (val << 7) as bf16
+        # Load scales as uint8 and convert to float32 for accumulation
+        # e8m0 format: exponent only, convert via (val << 7) as bf16, then to f32
         a_s_uint8 = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s_uint8 = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        # Convert e8m0 scales to bfloat16
-        # This is equivalent to: (scale.to(int16) << 7).view(bfloat16)
-        # In Triton, we need to do bit manipulation
-        a_s_int16 = a_s_uint8.to(tl.int16)
-        b_s_int16 = b_s_uint8.to(tl.int16)
-        a_s_bf16_bits = a_s_int16 << 7
-        b_s_bf16_bits = b_s_int16 << 7
-        a_s = a_s_bf16_bits.to(tl.bfloat16, bitcast=True)
-        b_s = b_s_bf16_bits.to(tl.bfloat16, bitcast=True)
+        # Convert e8m0 scales to float32
+        # This is: (scale.to(int16) << 7).view(bfloat16).to(float32)
+        a_s = (a_s_uint8.to(tl.int16) << 7).to(tl.bfloat16, bitcast=True).to(tl.float32)
+        b_s = (b_s_uint8.to(tl.int16) << 7).to(tl.bfloat16, bitcast=True).to(tl.float32)
 
-        # Compute scaled dot product
-        # For MXFP8, each 32-element group has one scale
-        # When BLOCK_SIZE_K == 32, we have one scale per iteration
-        # For larger BLOCK_SIZE_K, we'd need to handle multiple scales
-
-        # Simple case: BLOCK_SIZE_K == MXFP8_GROUP_K (32)
-        # Each tile gets one scale factor
-        accumulator += tl.dot(a, tl.trans(b)) * (
-            a_s[:, None].to(tl.float32) * b_s[None, :].to(tl.float32)
-        )
+        # Compute scaled dot product: [M, K] @ [K, N] = [M, N]
+        # No transpose needed because B is loaded as [K, N]
+        accumulator += tl.dot(a, b) * (a_s[:, None] * b_s[None, :])
 
         # Advance pointers
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -231,14 +322,14 @@ def mxfp8_triton_block_scaled_mm(
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
     else:
         # Default configuration optimized for MXFP8
-        # BLOCK_SIZE_K must be 32 to match MXFP8 block size
+        # BLOCK_SIZE_K must be 32 to match MXFP8 block size (one scale per block)
         config = {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 64,
             "BLOCK_SIZE_K": 32,  # Must match MXFP8_BLOCK_SIZE
-            "GROUP_SIZE_M": 8,
+            "GROUP_SIZE_M": 32,  # Larger group for better L2 cache reuse
             "num_warps": 4,
-            "num_stages": 3,
+            "num_stages": 4,  # More stages for better pipelining
         }
 
     def grid(META):
@@ -301,6 +392,115 @@ direct_register_custom_op(
     op_name="mxfp8_triton_mm",
     op_func=_mxfp8_triton_mm_func,
     fake_impl=_mxfp8_triton_mm_fake,
+)
+
+
+def mxfp8_dequant_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """
+    Optimized bf16 input x MXFP8 weight matmul with on-the-fly dequantization.
+
+    Computes C = A @ B.T where:
+    - A: [M, K] activation in bfloat16 (no quantization needed!)
+    - B: [N, K] weight in float8_e4m3fn
+    - Bs: [N, K // 32] weight scales in uint8 (e8m0 format)
+
+    This avoids the expensive input quantization step.
+
+    Returns:
+        C: [M, N] output in output_dtype (bfloat16)
+    """
+    assert A.dtype == torch.bfloat16, f"A must be bfloat16, got {A.dtype}"
+    assert B.dtype == MXFP8_VALUE_DTYPE, f"B must be {MXFP8_VALUE_DTYPE}, got {B.dtype}"
+    assert output_dtype == torch.bfloat16, "Only bfloat16 output is supported"
+
+    # A: [M, K], B: [N, K] (will compute A @ B.T)
+    assert A.ndim == 2 and B.ndim == 2
+    M, K = A.shape
+    N, K_b = B.shape
+    assert K_b == K, f"K dimension mismatch: {K} vs {K_b}"
+
+    # Validate scale shapes
+    assert Bs.shape == (N, K // MXFP8_BLOCK_SIZE), (
+        f"Bs shape mismatch: expected {(N, K // MXFP8_BLOCK_SIZE)}, got {Bs.shape}"
+    )
+
+    # Ensure contiguous
+    A = A.contiguous()
+    B = B.contiguous()
+    Bs = Bs.contiguous()
+
+    # Allocate output
+    C = torch.empty((M, N), device=A.device, dtype=output_dtype)
+
+    # Default configuration for dequant GEMM
+    # BLOCK_SIZE_K must be 32 to match MXFP8 block size
+    config = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 32,
+        "num_warps": 4,
+        "num_stages": 4,
+    }
+
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+
+    _mxfp8_dequant_gemm_kernel[grid](
+        A,
+        B,
+        C,
+        Bs,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(0),
+        C.stride(1),
+        Bs.stride(0),
+        Bs.stride(1),
+        **config,
+    )
+
+    return C
+
+
+def _mxfp8_dequant_gemm_func(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Wrapper for custom op registration."""
+    return mxfp8_dequant_gemm(input, weight, weight_scale, output_dtype)
+
+
+def _mxfp8_dequant_gemm_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Fake implementation for torch.compile tracing."""
+    M = input.size(0)
+    N = weight.size(0)
+    return torch.empty((M, N), dtype=output_dtype, device=input.device)
+
+
+direct_register_custom_op(
+    op_name="mxfp8_dequant_gemm",
+    op_func=_mxfp8_dequant_gemm_func,
+    fake_impl=_mxfp8_dequant_gemm_fake,
 )
 
 
@@ -507,11 +707,10 @@ class Mxfp8LinearOp:
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Triton kernel implementation for MXFP8 linear.
+        Optimized Triton kernel for MXFP8 linear with on-the-fly weight dequant.
 
-        Uses the custom Triton kernel for MXFP8 block-scaled matrix multiplication.
-        This is useful when torch._scaled_mm doesn't support MXFP8 or for platforms
-        without native MXFP8 support.
+        Uses bf16 input directly (no quantization!) and dequantizes FP8 weights
+        on-the-fly within the kernel. This is much faster than quantizing input.
         """
         assert weight.dtype == MXFP8_VALUE_DTYPE
         assert out_dtype == torch.bfloat16, "Only bfloat16 is supported as out_dtype"
@@ -521,33 +720,22 @@ class Mxfp8LinearOp:
         out_features, in_features = weight.shape
         scale_k = in_features // MXFP8_BLOCK_SIZE
 
-        # Quantize input to MXFP8 (non-swizzled for Triton kernel)
-        swizzled = False
+        # Flatten input for the GEMM
         input_flat = input.view(-1, input.shape[-1])
-        input_mxfp8, input_mxfp8_scales = torch.ops.vllm.mxfp8_quantize(
-            input_flat, swizzled
-        )
 
         # Convert weight scales from float8_e8m0fnu to uint8 for Triton kernel
-        # The Triton kernel handles the e8m0 → bf16 conversion internally
         weight_scale_uint8 = weight_scale.view(MXFP8_SCALE_DTYPE)
 
-        # Handle padded weight scales (same as fallback)
+        # Handle padded weight scales
         out_features_padded = (out_features + 127) // 128 * 128
         weight_scale_2d = weight_scale_uint8.view(out_features_padded, scale_k)[
             :out_features, :
         ].contiguous()
 
-        # Ensure input scales are 2D [M, K//32]
-        input_mxfp8_scales = input_mxfp8_scales.view(
-            input_flat.shape[0], -1
-        ).contiguous()
-
-        # Call the Triton kernel
-        output = torch.ops.vllm.mxfp8_triton_mm(
-            input_mxfp8,
+        # Call the optimized dequant GEMM kernel (no input quantization!)
+        output = torch.ops.vllm.mxfp8_dequant_gemm(
+            input_flat,
             weight,
-            input_mxfp8_scales,
             weight_scale_2d,
             out_dtype,
         )
