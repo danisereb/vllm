@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -36,6 +37,41 @@ from vllm.v1.worker.ubatching import (
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _is_blackwell() -> bool:
+    """Check if running on Blackwell (SM100+) GPU. Cached at first call."""
+    from vllm.platforms import current_platform
+
+    return current_platform.is_device_capability_family(100)
+
+
+def get_adaptive_moe_chunk_size(num_tokens: int) -> int:
+    """
+    Compute adaptive chunk size based on token count and GPU architecture.
+
+    On Blackwell (B200): Large batches benefit from larger chunks (64K)
+    due to higher HBM bandwidth and larger L2 cache.
+    """
+    # Only apply adaptive logic on Blackwell GPUs
+    if not _is_blackwell():
+        return envs.VLLM_FUSED_MOE_CHUNK_SIZE
+
+    # If user explicitly set the env var, respect it
+    user_chunk_size = envs.VLLM_FUSED_MOE_CHUNK_SIZE
+    DEFAULT_CHUNK_SIZE = 16 * 1024
+
+    # Check if user overrode the default (16K)
+    if user_chunk_size != DEFAULT_CHUNK_SIZE:
+        return user_chunk_size
+
+    # Blackwell-specific adaptive logic
+    if num_tokens <= 384:
+        return 16 * 1024  # 16K - better for small batches
+    else:
+        return 64 * 1024  # 64K - better for larger batches on Blackwell
+
 
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
@@ -859,14 +895,12 @@ class FusedMoEModularKernel(torch.nn.Module):
         get num_chunks == 1. Take max(M, 1) to avoid divide by zero.
         If there are no tokens to process, the number of chunks will be zero.
         """
-        CHUNK_SIZE = max(
-            1,
-            (
-                M
-                if not self.fused_experts.enable_chunking()
-                else min(M, envs.VLLM_FUSED_MOE_CHUNK_SIZE)
-            ),
-        )
+        if not self.fused_experts.enable_chunking():
+            CHUNK_SIZE = max(1, M)
+        else:
+            adaptive_chunk = get_adaptive_moe_chunk_size(M)
+            CHUNK_SIZE = max(1, min(M, adaptive_chunk))
+
         num_chunks = cdiv(M, CHUNK_SIZE)
         # If there are no tokens, then there should be no loop iterations.
         assert M > 0 or num_chunks == 0
@@ -901,16 +935,19 @@ class FusedMoEModularKernel(torch.nn.Module):
 
         # Force worst-case allocation in profiling run for
         # "mk.FusedMoEModularKernel.Standard" formats where this is only bounded
-        # by `VLLM_FUSED_MOE_CHUNK_SIZE` and may not be seen during profiling with
+        # by the max adaptive chunk size and may not be seen during profiling with
         # DP+EP due to the random token routing.
         is_profile_run = (
             is_forward_context_available()
             and get_forward_context().attn_metadata is None
         )
         if is_profile_run and self.fused_experts.enable_chunking() and self.is_dp_ep:
+            # Use the largest possible chunk size for worst-case allocation
+            # This matches the max from get_adaptive_moe_chunk_size (64K)
+            max_chunk_for_profiling = max(64 * 1024, envs.VLLM_FUSED_MOE_CHUNK_SIZE)
             max_workspace_13, max_workspace_2, max_fused_out_shape = (
                 self.fused_experts.workspace_shapes(
-                    envs.VLLM_FUSED_MOE_CHUNK_SIZE,
+                    max_chunk_for_profiling,
                     N,
                     K,
                     top_k,

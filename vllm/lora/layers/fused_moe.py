@@ -33,6 +33,7 @@ from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEModularKernel,
+    get_adaptive_moe_chunk_size,
 )
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoEP,
@@ -177,8 +178,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     use_int8_w8a16=False,
                     use_int4_w4a16=False,
                 )
-                CHUNK_SIZE = envs.VLLM_FUSED_MOE_CHUNK_SIZE
                 num_tokens = hidden_states.size(0)
+                CHUNK_SIZE = get_adaptive_moe_chunk_size(num_tokens)
                 M = min(num_tokens, CHUNK_SIZE)
                 max_lora_rank = self.w13_lora_a_stacked[0].shape[-2]
                 shrink_config, expand_config = self._get_lora_moe_configs(
@@ -252,8 +253,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     use_int8_w8a16=False,
                     use_int4_w4a16=False,
                 )
-                CHUNK_SIZE = envs.VLLM_FUSED_MOE_CHUNK_SIZE
                 num_tokens = hidden_states.size(0)
+                CHUNK_SIZE = get_adaptive_moe_chunk_size(num_tokens)
                 M = min(num_tokens, CHUNK_SIZE)
                 max_lora_rank = self.w2_lora_a_stacked[0].shape[-2]
                 shrink_config, expand_config = self._get_lora_moe_configs(
