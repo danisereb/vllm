@@ -15,6 +15,7 @@ import ray
 import torch
 from ray.experimental.tqdm_ray import tqdm
 
+import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -32,6 +33,9 @@ from vllm.transformers_utils.config import get_config
 from vllm.triton_utils import triton
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.torch_utils import set_random_seed
+
+# Default chunk sizes to benchmark (powers of 2 from 4K to 64K)
+DEFAULT_CHUNK_SIZES = [4096, 8192, 16384, 32768, 65536]
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
@@ -596,6 +600,100 @@ class BenchmarkWorker:
         assert best_config is not None
         return best_config
 
+    def benchmark_chunk_sizes(
+        self,
+        num_tokens: int,
+        num_experts: int,
+        shard_intermediate_size: int,
+        hidden_size: int,
+        topk: int,
+        dtype: torch.dtype,
+        use_fp8_w8a8: bool,
+        use_int8_w8a16: bool,
+        chunk_sizes: list[int],
+        block_quant_shape: list[int],
+        use_deep_gemm: bool,
+    ) -> tuple[int, float, dict[int, float]]:
+        """
+        Benchmark different chunk sizes for a given batch size.
+
+        Returns:
+            best_chunk_size: The chunk size with the lowest kernel time
+            best_time: The kernel time for the best chunk size
+            all_times: Dict mapping chunk_size -> kernel_time for all tested sizes
+        """
+        set_random_seed(self.seed)
+
+        # Get the current best kernel config (same logic as benchmark method)
+        dtype_str = _get_config_dtype_str(
+            dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8
+        )
+        block_n = block_quant_shape[0] if block_quant_shape else None
+        block_k = block_quant_shape[1] if block_quant_shape else None
+        op_config = get_moe_configs(
+            num_experts, shard_intermediate_size // 2, dtype_str, block_n, block_k
+        )
+        if op_config is None:
+            config = get_default_config(
+                num_tokens,
+                num_experts,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype_str,
+                block_quant_shape,
+            )
+        else:
+            config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]
+
+        best_chunk_size = None
+        best_time = float("inf")
+        all_times: dict[int, float] = {}
+
+        # Only test chunk sizes smaller than or equal to num_tokens
+        # (larger chunk sizes would have no effect)
+        relevant_chunk_sizes = [cs for cs in chunk_sizes if cs <= num_tokens * 2]
+        if not relevant_chunk_sizes:
+            # If batch size is very small, just use the smallest chunk size
+            relevant_chunk_sizes = [min(chunk_sizes)]
+
+        for chunk_size in relevant_chunk_sizes:
+            # Override the chunk size in envs module
+            envs.VLLM_FUSED_MOE_CHUNK_SIZE = chunk_size
+
+            try:
+                kernel_time = benchmark_config(
+                    config,
+                    num_tokens,
+                    num_experts,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype,
+                    use_fp8_w8a8,
+                    use_int8_w8a16,
+                    num_iters=100,
+                    block_quant_shape=block_quant_shape,
+                    use_deep_gemm=use_deep_gemm,
+                )
+                all_times[chunk_size] = kernel_time
+
+                if kernel_time < best_time:
+                    best_time = kernel_time
+                    best_chunk_size = chunk_size
+            except Exception as e:
+                print(f"Warning: chunk_size={chunk_size} failed: {e}")
+                continue
+
+        # Restore default chunk size
+        envs.VLLM_FUSED_MOE_CHUNK_SIZE = 16 * 1024
+
+        now = datetime.now()
+        print(
+            f"{now.ctime()}] Completed chunk size benchmark for batch_size={num_tokens}"
+        )
+        return best_chunk_size, best_time, all_times
+
 
 def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
     return {
@@ -643,6 +741,35 @@ def save_configs(
     print(f"Writing best config to {filename}...")
     with open(filename, "w") as f:
         json.dump({"triton_version": triton.__version__, **configs}, f, indent=4)
+        f.write("\n")
+
+
+def get_chunk_size_config_file_name() -> str:
+    """Generate config file name for chunk sizes based on device."""
+    device_name = current_platform.get_device_name().replace(" ", "_")
+    # Normalize H200 family devices
+    if "H200" in device_name.split("_"):
+        device_name = "NVIDIA_H200"
+    return f"chunk_size_device_name={device_name}.json"
+
+
+def save_chunk_size_configs(
+    configs: dict[int, int],
+    save_dir: str,
+) -> None:
+    """
+    Save chunk size configurations to JSON file.
+
+    Args:
+        configs: Dict mapping batch_size -> optimal_chunk_size
+        save_dir: Directory to save the config file
+    """
+    filename = get_chunk_size_config_file_name()
+    os.makedirs(save_dir, exist_ok=True)
+    filepath = os.path.join(save_dir, filename)
+    print(f"Writing chunk size config to {filepath}...")
+    with open(filepath, "w") as f:
+        json.dump(configs, f, indent=4)
         f.write("\n")
 
 
@@ -825,6 +952,88 @@ def main(args: argparse.Namespace):
         )
         end = time.time()
         print(f"Tuning took {end - start:.2f} seconds")
+    elif args.benchmark_chunk_size:
+        # Benchmark different chunk sizes
+        chunk_sizes = sorted(args.chunk_sizes)
+        print(f"Benchmarking chunk sizes: {chunk_sizes}")
+        print(
+            f"Model: E={E}, intermediate_size={shard_intermediate_size // 2}, "
+            f"hidden_size={hidden_size}, topk={topk}"
+        )
+        print("-" * 80)
+
+        start = time.time()
+        outputs = _distribute(
+            "benchmark_chunk_sizes",
+            [
+                (
+                    batch_size,
+                    E,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype,
+                    use_fp8_w8a8,
+                    use_int8_w8a16,
+                    chunk_sizes,
+                    block_quant_shape,
+                    use_deep_gemm,
+                )
+                for batch_size in batch_sizes
+            ],
+        )
+
+        # Collect and display results
+        print("\n" + "=" * 80)
+        print("CHUNK SIZE BENCHMARK RESULTS")
+        print("=" * 80)
+        print(
+            f"{'Batch Size':>12} | {'Best Chunk':>12} | {'Best Time (us)':>14} | "
+            "Chunk Size -> Time (us)"
+        )
+        print("-" * 80)
+
+        best_by_batch: dict[int, tuple[int, float]] = {}
+        for batch_size, (best_chunk, best_time, all_times) in zip(batch_sizes, outputs):
+            if best_chunk is None:
+                print(f"{batch_size:>12} | {'N/A':>12} | {'N/A':>14} | (all failed)")
+                continue
+
+            best_by_batch[batch_size] = (best_chunk, best_time)
+            times_str = ", ".join(
+                f"{cs}={t:.1f}" + ("*" if cs == best_chunk else "")
+                for cs, t in sorted(all_times.items())
+            )
+            print(
+                f"{batch_size:>12} | {best_chunk:>12} | "
+                f"{best_time:>14.2f} | {times_str}"
+            )
+
+        end = time.time()
+        print("-" * 80)
+        print(f"Benchmark took {end - start:.2f} seconds")
+
+        # Save and summarize results
+        if best_by_batch:
+            # Save chunk size configs to JSON
+            chunk_configs = {
+                batch_size: chunk_size
+                for batch_size, (chunk_size, _) in best_by_batch.items()
+            }
+            save_chunk_size_configs(chunk_configs, args.save_dir)
+
+            # Find the most common best chunk size across batch sizes
+            from collections import Counter
+
+            chunk_counts = Counter(chunk for chunk, _ in best_by_batch.values())
+            most_common_chunk = chunk_counts.most_common(1)[0][0]
+            print(
+                f"\nAlternative: export VLLM_FUSED_MOE_CHUNK_SIZE={most_common_chunk}"
+            )
+            print(
+                "(Use env var for a single global value, or use the JSON config for "
+                "per-batch-size optimization)"
+            )
     else:
         outputs = _distribute(
             "benchmark",
@@ -869,6 +1078,18 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, nargs="+", required=False)
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument(
+        "--benchmark-chunk-size",
+        action="store_true",
+        help="Benchmark different VLLM_FUSED_MOE_CHUNK_SIZE values to find optimal",
+    )
+    parser.add_argument(
+        "--chunk-sizes",
+        type=int,
+        nargs="+",
+        default=DEFAULT_CHUNK_SIZES,
+        help="Chunk sizes to benchmark (default: 4096 8192 16384 32768 65536)",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--model-prefix", type=str, required=False)
     args = parser.parse_args()

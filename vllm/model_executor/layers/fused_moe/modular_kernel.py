@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import json
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -47,30 +49,109 @@ def _is_blackwell() -> bool:
     return current_platform.is_device_capability_family(100)
 
 
+# Default chunk size (16K)
+DEFAULT_CHUNK_SIZE = 16 * 1024
+
+
+def get_chunk_size_config_file_name() -> str:
+    """Generate config file name for chunk sizes based on device."""
+    from vllm.platforms import current_platform
+
+    device_name = current_platform.get_device_name().replace(" ", "_")
+    # Normalize H200 family devices
+    if "H200" in device_name.split("_"):
+        device_name = "NVIDIA_H200"
+    return f"chunk_size_device_name={device_name}.json"
+
+
+@functools.lru_cache(maxsize=1)
+def get_chunk_size_configs() -> dict[int, int] | None:
+    """
+    Load chunk size configurations from JSON file.
+
+    Returns a dictionary mapping batch sizes (num_tokens) to optimal chunk sizes,
+    or None if no config file is found.
+
+    Config file format:
+    {
+        "1": 4096,
+        "16": 8192,
+        "256": 16384,
+        "1024": 32768,
+        ...
+    }
+    """
+    json_file_name = get_chunk_size_config_file_name()
+    config_file_paths = []
+
+    # Prioritize user-defined config
+    user_defined_config_folder = envs.VLLM_TUNED_CONFIG_FOLDER
+    if user_defined_config_folder is not None:
+        user_defined_config_file_path = os.path.join(
+            user_defined_config_folder, json_file_name
+        )
+        config_file_paths.append(user_defined_config_file_path)
+
+    # Default config location (same directory as kernel configs)
+    default_config_file_path = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+    )
+    config_file_paths.append(default_config_file_path)
+
+    for config_file_path in config_file_paths:
+        if os.path.exists(config_file_path):
+            with open(config_file_path) as f:
+                logger.info_once(
+                    "Using chunk size configuration from %s",
+                    config_file_path,
+                )
+                config = json.load(f)
+                # Convert string keys to int
+                return {int(key): val for key, val in config.items()}
+
+    return None
+
+
+def _get_default_chunk_size(num_tokens: int) -> int:
+    """
+    Get default chunk size when no JSON config is available.
+
+    Falls back to architecture-specific defaults.
+    """
+    # Blackwell-specific adaptive logic
+    if _is_blackwell():
+        if num_tokens <= 384:
+            return 16 * 1024  # 16K - better for small batches
+        else:
+            return 64 * 1024  # 64K - better for larger batches on Blackwell
+
+    # Default for other architectures
+    return DEFAULT_CHUNK_SIZE
+
+
 def get_adaptive_moe_chunk_size(num_tokens: int) -> int:
     """
-    Compute adaptive chunk size based on token count and GPU architecture.
+    Get optimal chunk size for MoE layer based on token count.
 
-    On Blackwell (B200): Large batches benefit from larger chunks (64K)
-    due to higher HBM bandwidth and larger L2 cache.
+    Priority:
+    1. Environment variable override (VLLM_FUSED_MOE_CHUNK_SIZE)
+    2. JSON config file (if available)
+    3. Architecture-specific defaults
     """
-    # Only apply adaptive logic on Blackwell GPUs
-    if not _is_blackwell():
-        return envs.VLLM_FUSED_MOE_CHUNK_SIZE
-
     # If user explicitly set the env var, respect it
     user_chunk_size = envs.VLLM_FUSED_MOE_CHUNK_SIZE
-    DEFAULT_CHUNK_SIZE = 16 * 1024
-
-    # Check if user overrode the default (16K)
     if user_chunk_size != DEFAULT_CHUNK_SIZE:
         return user_chunk_size
 
-    # Blackwell-specific adaptive logic
-    if num_tokens <= 384:
-        return 16 * 1024  # 16K - better for small batches
-    else:
-        return 64 * 1024  # 64K - better for larger batches on Blackwell
+    # Try to load from JSON config
+    chunk_configs = get_chunk_size_configs()
+    if chunk_configs:
+        # Find the closest batch size in the config
+        closest_batch = min(chunk_configs.keys(), key=lambda x: abs(x - num_tokens))
+        return chunk_configs[closest_batch]
+
+    # Fall back to architecture-specific defaults
+    return _get_default_chunk_size(num_tokens)
 
 
 #
