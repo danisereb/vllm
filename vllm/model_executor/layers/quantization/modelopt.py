@@ -1353,11 +1353,16 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     ) -> None:
         super().__init__(moe_config)
         self.quant_config = quant_config
+
+        # W4A16 mode: Use FP4 weights with BF16 activations (no activation quant)
+        # This avoids activation quantization overhead but uses more compute
+        self.use_w4a16 = envs.VLLM_NVFP4_USE_W4A16
+
         # Select experts implementation.
         self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
             config=self.moe,
             weight_key=kNvfp4Static,
-            activation_key=kNvfp4Dynamic,
+            activation_key=None if self.use_w4a16 else kNvfp4Dynamic,
         )
 
         # Delay creation of the kernel until after process-weights.

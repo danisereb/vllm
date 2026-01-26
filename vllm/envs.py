@@ -217,6 +217,7 @@ if TYPE_CHECKING:
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
+    VLLM_NVFP4_USE_W4A16: bool = False
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
@@ -1457,6 +1458,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "marlin",
         ],
     ),
+    # Use W4A16 mode for NVFP4 models (FP4 weights, BF16 activations).
+    # This avoids activation quantization overhead at the cost of
+    # slightly more compute. May improve performance for some workloads.
+    "VLLM_NVFP4_USE_W4A16": lambda: bool(int(os.getenv("VLLM_NVFP4_USE_W4A16", "0"))),
     # Controls garbage collection during CUDA graph capture.
     # If set to 0 (default), enables GC freezing to speed up capture time.
     # If set to 1, allows GC to run during capture.

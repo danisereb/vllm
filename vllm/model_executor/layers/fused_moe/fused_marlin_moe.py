@@ -563,7 +563,9 @@ class MarlinExpertsBase(mk.FusedMoEPermuteExpertsUnpermute):
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
-        return False
+        # Marlin handles non-gated MoE via "*_no_mul" activations
+        # (see w13_num_shards = 1 if "no_mul" in activation in marlin_moe)
+        return True
 
     @staticmethod
     def _supports_quant_scheme(
