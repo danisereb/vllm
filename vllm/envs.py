@@ -217,7 +217,7 @@ if TYPE_CHECKING:
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
-    VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS: bool = False
+    VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS: Literal["", "estimate", "measure"] = ""
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
@@ -483,6 +483,23 @@ def get_env_or_set_default(
 # --8<-- [start:env-vars-definition]
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_adaptive_mamba_mode(value: str) -> Literal["", "estimate", "measure"]:
+    """Parse VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS value."""
+    value = value.strip().lower()
+    if value in ("", "0", "false"):
+        return ""
+    elif value in ("1", "true", "estimate"):
+        return "estimate"
+    elif value == "measure":
+        return "measure"
+    else:
+        raise ValueError(
+            f"Invalid VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS value: {value!r}. "
+            "Expected: '' (disabled), 'estimate', or 'measure'"
+        )
+
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
@@ -1464,8 +1481,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory bandwidth saturation at high batch sizes.
     # This is especially useful for models like Nemotron-H with large
     # Mamba state (float32 cache).
-    "VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS": lambda: bool(
-        int(os.getenv("VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS", "0"))
+    # Values:
+    #   "" or "0": disabled (default)
+    #   "1" or "estimate": use heuristic based on GPU bandwidth estimates
+    #   "measure": run actual kernel benchmark at startup (slower but accurate)
+    "VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS": lambda: _parse_adaptive_mamba_mode(
+        os.getenv("VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS", "")
     ),
     # Controls garbage collection during CUDA graph capture.
     # If set to 0 (default), enables GC freezing to speed up capture time.

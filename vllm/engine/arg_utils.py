@@ -1993,20 +1993,16 @@ class EngineArgs:
             # Not supported - return None to indicate unsupported GPU
             return None
 
-    def _calculate_adaptive_mamba_max_num_seqs(
+    def _get_mamba_config_params(
         self,
         model_config: ModelConfig,
-    ) -> int | None:
+    ) -> tuple[int, int, int, int, int, int] | None:
         """
-        Calculate optimal max_num_seqs for Mamba/hybrid models based on
-        Mamba state size and GPU memory bandwidth.
-
-        The Mamba SSM state is the primary memory bandwidth bottleneck during
-        decode. This function estimates the optimal batch size to avoid
-        saturating memory bandwidth.
+        Extract Mamba configuration parameters from model config.
 
         Returns:
-            Optimal max_num_seqs, or None if model doesn't have Mamba layers.
+            Tuple of (num_heads, head_dim, state_size, num_mamba_layers,
+                      dtype_bytes, ngroups) or None if not a Mamba model.
         """
         if not model_config.has_inner_state:
             return None
@@ -2035,6 +2031,10 @@ class EngineArgs:
             or getattr(hf_config, "state_size", None)
         )
 
+        ngroups = getattr(hf_config, "mamba_n_groups", 1) or getattr(
+            hf_config, "n_groups", 1
+        )
+
         # Check if it's a Mamba2 model (has heads) or Mamba1
         if num_heads is None or head_dim is None or state_size is None:
             # Try Mamba1 style config
@@ -2049,16 +2049,15 @@ class EngineArgs:
 
             if intermediate_size and state_size:
                 # Mamba1: state shape is [intermediate_size, state_size]
-                state_elements = intermediate_size * state_size
+                # Treat as num_heads=1, head_dim=intermediate_size
+                num_heads = 1
+                head_dim = intermediate_size
             else:
                 logger.debug(
                     "Could not determine Mamba state size for adaptive "
                     "max_num_seqs calculation."
                 )
                 return None
-        else:
-            # Mamba2: state shape is [num_heads, head_dim, state_size]
-            state_elements = num_heads * head_dim * state_size
 
         # Get cache dtype size
         mamba_cache_dtype = self.mamba_ssm_cache_dtype or self.mamba_cache_dtype
@@ -2078,6 +2077,31 @@ class EngineArgs:
 
         if num_mamba_layers == 0:
             return None
+
+        return (num_heads, head_dim, state_size, num_mamba_layers, dtype_bytes, ngroups)
+
+    def _estimate_adaptive_mamba_max_num_seqs(
+        self,
+        model_config: ModelConfig,
+    ) -> int | None:
+        """
+        Estimate optimal max_num_seqs using GPU bandwidth heuristics.
+
+        This is a fast estimate based on GPU memory bandwidth and Mamba state
+        size. For more accurate results, use the 'measure' mode which runs
+        actual kernel benchmarks.
+
+        Returns:
+            Estimated optimal max_num_seqs, or None if not a Mamba model.
+        """
+        params = self._get_mamba_config_params(model_config)
+        if params is None:
+            return None
+
+        num_heads, head_dim, state_size, num_mamba_layers, dtype_bytes, _ = params
+
+        # Mamba2: state shape is [num_heads, head_dim, state_size]
+        state_elements = num_heads * head_dim * state_size
 
         # Calculate state size per sequence (bytes)
         # State is read and written each step, so 2x traffic
@@ -2099,13 +2123,11 @@ class EngineArgs:
                 f"VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS is only supported on "
                 f"Blackwell (SM 10.x) and Hopper (SM 9.x) GPUs. "
                 f"Detected GPU capability: {cap_str}. "
-                f"Please set VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS=0 and manually "
+                f"Please set VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS='' and manually "
                 f"tune --max-num-seqs for your hardware."
             )
 
         # Empirically tuned: ~7 GB state traffic per TB/s of effective bandwidth
-        # This keeps SSM kernel time reasonable while leaving headroom for
-        # MoE, attention, and scheduler overhead
         target_state_traffic_bytes = int(gpu_bw_tb_s * 7e9)  # 7 GB per TB/s
 
         # Calculate optimal max_num_seqs
@@ -2118,6 +2140,7 @@ class EngineArgs:
         # Clamp to reasonable range
         optimal_seqs = max(64, min(optimal_seqs, 1024))
 
+        mamba_cache_dtype = self.mamba_ssm_cache_dtype or self.mamba_cache_dtype
         gpu_name = (
             current_platform.get_device_name()
             if hasattr(current_platform, "get_device_name")
@@ -2125,7 +2148,7 @@ class EngineArgs:
         )
 
         logger.info(
-            "Adaptive Mamba max_num_seqs: calculated optimal=%d "
+            "Adaptive Mamba max_num_seqs (estimate): optimal=%d "
             "(GPU=%s, effective_bw=%.1f TB/s, state=%d elements, "
             "%d Mamba layers, dtype=%s, TP=%d)",
             optimal_seqs,
@@ -2138,6 +2161,228 @@ class EngineArgs:
         )
 
         return optimal_seqs
+
+    def _measure_adaptive_mamba_max_num_seqs(
+        self,
+        model_config: ModelConfig,
+    ) -> int | None:
+        """
+        Measure optimal max_num_seqs by benchmarking the actual Mamba kernel.
+
+        This runs the SSM kernel at different batch sizes and finds where
+        memory bandwidth saturates (stops improving). Going beyond this point
+        just increases latency without better efficiency.
+
+        Returns:
+            Measured optimal max_num_seqs, or None if not a Mamba model.
+        """
+        params = self._get_mamba_config_params(model_config)
+        if params is None:
+            return None
+
+        num_heads, head_dim, state_size, num_mamba_layers, dtype_bytes, ngroups = params
+
+        logger.info(
+            "Measuring optimal Mamba max_num_seqs (this may take 10-30 seconds)..."
+        )
+
+        import torch
+
+        from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
+            selective_state_update,
+        )
+
+        device = torch.device("cuda:0")
+        dtype = torch.float32 if dtype_bytes == 4 else torch.bfloat16
+        tp_size = self.tensor_parallel_size
+
+        # Adjust for TP (state is sharded across TP ranks)
+        nheads_per_rank = num_heads // tp_size
+
+        # Batch sizes to test
+        batch_sizes = [
+            32,
+            64,
+            96,
+            128,
+            192,
+            256,
+            320,
+            384,
+            448,
+            512,
+            640,
+            768,
+            896,
+            1024,
+        ]
+
+        # Results: (batch_size, effective_bandwidth_tb_s)
+        results: list[tuple[int, float]] = []
+
+        for batch_size in batch_sizes:
+            try:
+                # Create tensors
+                state = torch.randn(
+                    batch_size,
+                    nheads_per_rank,
+                    head_dim,
+                    state_size,
+                    device=device,
+                    dtype=dtype,
+                )
+                x = torch.randn(
+                    batch_size,
+                    nheads_per_rank,
+                    head_dim,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+                dt = torch.randn_like(x)
+                A = (
+                    torch.randn(
+                        nheads_per_rank,
+                        head_dim,
+                        state_size,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    * -0.1
+                )
+                B = torch.randn(
+                    batch_size, ngroups, state_size, device=device, dtype=torch.bfloat16
+                )
+                C = torch.randn_like(B)
+                D = torch.randn(
+                    nheads_per_rank, head_dim, device=device, dtype=torch.bfloat16
+                )
+                z = torch.randn_like(x)
+                dt_bias = torch.randn(
+                    nheads_per_rank, head_dim, device=device, dtype=torch.bfloat16
+                )
+                out = torch.empty_like(x)
+
+                # Warmup
+                for _ in range(5):
+                    for _ in range(num_mamba_layers):
+                        selective_state_update(
+                            state=state,
+                            x=x,
+                            dt=dt,
+                            A=A,
+                            B=B,
+                            C=C,
+                            D=D,
+                            z=z,
+                            dt_bias=dt_bias,
+                            dt_softplus=True,
+                            out=out,
+                        )
+                torch.cuda.synchronize()
+
+                # Benchmark
+                num_iters = 20
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+
+                start.record()
+                for _ in range(num_iters):
+                    for _ in range(num_mamba_layers):
+                        selective_state_update(
+                            state=state,
+                            x=x,
+                            dt=dt,
+                            A=A,
+                            B=B,
+                            C=C,
+                            D=D,
+                            z=z,
+                            dt_bias=dt_bias,
+                            dt_softplus=True,
+                            out=out,
+                        )
+                end.record()
+                torch.cuda.synchronize()
+
+                time_ms = start.elapsed_time(end) / num_iters
+
+                # Calculate effective bandwidth
+                state_bytes = (
+                    batch_size
+                    * nheads_per_rank
+                    * head_dim
+                    * state_size
+                    * dtype_bytes
+                    * num_mamba_layers
+                    * 2  # read + write
+                )
+                effective_bw_tb_s = (state_bytes / 1e12) / (time_ms / 1000)
+                results.append((batch_size, effective_bw_tb_s))
+
+                # Clean up
+                del state, x, dt, A, B, C, D, z, dt_bias, out
+                torch.cuda.empty_cache()
+
+            except torch.cuda.OutOfMemoryError:
+                break
+
+        if not results:
+            logger.warning("Could not benchmark Mamba kernel, falling back to estimate")
+            return self._estimate_adaptive_mamba_max_num_seqs(model_config)
+
+        # Find where bandwidth saturates (< 0.5% improvement)
+        optimal_batch = results[0][0]
+        prev_bw = 0.0
+        bw_threshold = 0.005
+
+        for batch_size, bw in results:
+            if prev_bw > 0:
+                improvement = (bw - prev_bw) / prev_bw
+                if improvement >= bw_threshold:
+                    optimal_batch = batch_size
+            prev_bw = bw
+
+        # Scale by TP size for the recommended value
+        optimal_seqs = optimal_batch * tp_size
+
+        gpu_name = (
+            current_platform.get_device_name()
+            if hasattr(current_platform, "get_device_name")
+            else "unknown"
+        )
+
+        max_bw = max(r[1] for r in results)
+        logger.info(
+            "Adaptive Mamba max_num_seqs (measured): optimal=%d "
+            "(GPU=%s, bandwidth saturates at %.2f TB/s, TP=%d)",
+            optimal_seqs,
+            gpu_name,
+            max_bw,
+            tp_size,
+        )
+
+        return optimal_seqs
+
+    def _calculate_adaptive_mamba_max_num_seqs(
+        self,
+        model_config: ModelConfig,
+        mode: str,
+    ) -> int | None:
+        """
+        Calculate optimal max_num_seqs for Mamba/hybrid models.
+
+        Args:
+            model_config: The model configuration.
+            mode: "estimate" for heuristic-based calculation,
+                  "measure" for actual kernel benchmarking.
+
+        Returns:
+            Optimal max_num_seqs, or None if model doesn't have Mamba layers.
+        """
+        if mode == "measure":
+            return self._measure_adaptive_mamba_max_num_seqs(model_config)
+        else:
+            return self._estimate_adaptive_mamba_max_num_seqs(model_config)
 
     def _set_default_max_num_seqs_and_batched_tokens_args(
         self,
@@ -2167,14 +2412,18 @@ class EngineArgs:
 
         # Apply adaptive max_num_seqs for Mamba models if enabled
         # This acts as an upper bound even if user explicitly set a value
-        if envs.VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS:
-            adaptive_seqs = self._calculate_adaptive_mamba_max_num_seqs(model_config)
+        # Modes: "estimate" (fast heuristic), "measure" (actual kernel benchmark)
+        adaptive_mode = envs.VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS
+        if adaptive_mode:
+            adaptive_seqs = self._calculate_adaptive_mamba_max_num_seqs(
+                model_config, mode=adaptive_mode
+            )
             if adaptive_seqs is not None:
                 if self.max_num_seqs > adaptive_seqs:
                     logger.warning(
                         "Reducing max_num_seqs from %d to %d for optimal "
                         "Mamba model performance (memory bandwidth limit). "
-                        "Set VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS=0 to disable.",
+                        "Set VLLM_ADAPTIVE_MAMBA_MAX_NUM_SEQS='' to disable.",
                         self.max_num_seqs,
                         adaptive_seqs,
                     )
