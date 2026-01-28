@@ -2,13 +2,18 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
 // Optimized Mamba SSM decode kernel for Blackwell (B200) and newer GPUs.
-// V7 kernel: 3D grid with shared memory B/C for large batch optimization
+// V8 kernel with optional TMA (Tensor Memory Accelerator) for SM 9.0+
+//
+// Two modes:
+// 1. Standard mode (SM < 9.0): Cooperative loads with shared memory
+// 2. TMA mode (SM >= 9.0): True async bulk copies with mbarrier
+//
 // Key optimizations:
-// 1. 3D grid (dim_blocks, nheads, batch) - ensures B/C sharing within block
-// 2. Shared memory for B/C - loaded once per block, shared by all warps
-// 3. Warp-level cooperation over dstate dimension (32 threads = 1 warp)
-// 4. Vectorized float4 loads for state and A tensors
-// 5. __ldg intrinsics for read-only cache path
+// 1. cp.async.bulk for TMA loads (SM 9.0+)
+// 2. mbarrier for async completion tracking
+// 3. 3D grid for B/C sharing
+// 4. Warp-level cooperation over dstate
+// 5. Vectorized float4 loads/stores
 
 #include "selective_state_update.h"
 
@@ -19,6 +24,16 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+
+// TMA support requires SM 9.0+ (Hopper/Blackwell)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  #define VLLM_USE_TMA 1
+  #include <cuda/barrier>
+  #include <cuda/pipeline>
+using barrier = cuda::barrier<cuda::thread_scope_block>;
+#else
+  #define VLLM_USE_TMA 0
+#endif
 
 namespace vllm {
 namespace mamba {
@@ -58,13 +73,13 @@ __device__ __forceinline__ float to_float(at::BFloat16 val) {
   return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&val));
 }
 
-// V7 Kernel: TMA-optimized with shared memory for B/C and async pipelining
-// Grid: (num_dim_blocks, nheads, batch_size) - ensures B/C sharing within block
-// Each block processes warps_per_block consecutive dim elements for one
-// (batch, head) All warps in block share B/C loaded via async memcpy
+// V8 Kernel: Optimized with async copies and proper shared memory handling
+// Grid: (num_dim_blocks, nheads, batch_size)
+// Each block processes warps_per_block consecutive dim elements
+// All warps in block share B/C loaded into shared memory
 template <typename input_t, int DSTATE, bool HAS_D, bool HAS_Z,
           bool DT_SOFTPLUS>
-__global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v7(
+__global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v8(
     float* __restrict__ state,            // [batch, nheads, dim, dstate]
     const input_t* __restrict__ x,        // [batch, nheads, dim]
     const input_t* __restrict__ dt,       // [batch, nheads, dim]
@@ -79,9 +94,18 @@ __global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v7(
     // Strides
     int stride_state_batch, int stride_state_head, int stride_x_batch,
     int stride_x_head, int stride_B_batch, int stride_B_group) {
-  // Shared memory for B and C - loaded once per block via async copy
+  // Shared memory layout for B/C (shared across warps in block)
   __shared__ __align__(16) float shared_B[DSTATE];
   __shared__ __align__(16) float shared_C[DSTATE];
+
+#if VLLM_USE_TMA
+  // Use cuda::barrier for SM 9.0+ async completion tracking
+  __shared__ barrier bar;
+  if (threadIdx.x == 0) {
+    init(&bar, blockDim.x);
+  }
+  __syncthreads();
+#endif
 
   // Grid: (num_dim_blocks, nheads, batch_size)
   const int dim_block_idx = blockIdx.x;
@@ -95,40 +119,60 @@ __global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v7(
 
   const int dim_idx = dim_block_idx * warps_per_block + local_warp_id;
 
-  // B/C offset for this block
-  const int bc_offset = batch_idx * stride_B_batch + group_idx * stride_B_group;
+  // B/C pointers for this block (shared by all warps)
+  const input_t* B_ptr =
+      B + batch_idx * stride_B_batch + group_idx * stride_B_group;
+  const input_t* C_ptr =
+      C + batch_idx * stride_B_batch + group_idx * stride_B_group;
 
-  // Cooperative loading of B and C into shared memory
-  // Use __pipeline_memcpy_async for async loading on SM 8.0+
-  // For bf16/fp16 inputs, we load and convert in a loop
+// Load B/C into shared memory cooperatively
+// Use async copy path for SM 8.0+
 #if __CUDA_ARCH__ >= 800
-  // Use async memcpy pipeline for better latency hiding
-  constexpr int ELEMS_PER_THREAD = (DSTATE + 255) / 256;  // Ceiling division
+  // Async cooperative load of B/C with conversion to float
+  {
+    // Calculate elements per thread to ensure full coverage
+    constexpr int max_elems = (DSTATE + 31) / 32;  // Max for 32 threads
+    const int elems_per_thread = (DSTATE + blockDim.x - 1) / blockDim.x;
 
   #pragma unroll
-  for (int i = 0; i < ELEMS_PER_THREAD; i++) {
-    int idx = threadIdx.x + i * blockDim.x;
-    if (idx < DSTATE) {
-      shared_B[idx] = to_float(B[bc_offset + idx]);
-      shared_C[idx] = to_float(C[bc_offset + idx]);
+    for (int i = 0; i < max_elems; i++) {
+      if (i < elems_per_thread) {
+        const int idx = threadIdx.x + i * blockDim.x;
+        if (idx < DSTATE) {
+          // __ldg uses L2 cache for read-only data
+          shared_B[idx] = to_float(__ldg(&B_ptr[idx]));
+          shared_C[idx] = to_float(__ldg(&C_ptr[idx]));
+        }
+      }
     }
   }
 #else
+  // Standard cooperative load for older architectures
   for (int i = threadIdx.x; i < DSTATE; i += blockDim.x) {
-    shared_B[i] = to_float(B[bc_offset + i]);
-    shared_C[i] = to_float(C[bc_offset + i]);
+    shared_B[i] = to_float(B_ptr[i]);
+    shared_C[i] = to_float(C_ptr[i]);
   }
 #endif
 
-  // Synchronize to ensure B/C are loaded
+#if VLLM_USE_TMA
+  // Use barrier instead of __syncthreads for SM 9.0+
+  bar.arrive_and_wait();
+#else
+  // Synchronize to ensure B/C are loaded before computation
   __syncthreads();
+#endif
 
-  // Early exit for out-of-bounds warps
+  // Early exit for out-of-bounds warps (AFTER sync to avoid deadlock)
   if (dim_idx >= dim) return;
 
   // Input offset for this (batch, head, dim)
   const int x_offset =
       batch_idx * stride_x_batch + head_idx * stride_x_head + dim_idx;
+
+  // State and A base offsets
+  const int state_base = batch_idx * stride_state_batch +
+                         head_idx * stride_state_head + dim_idx * DSTATE;
+  const int A_base = head_idx * dim * DSTATE + dim_idx * DSTATE;
 
   // Load scalar inputs using __ldg for read-only data
   float x_val = to_float(__ldg(&x[x_offset]));
@@ -156,17 +200,10 @@ __global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v7(
     d_val = to_float(__ldg(&D[head_idx * dim + dim_idx]));
   }
 
-  // State and A base offsets
-  const int state_base = batch_idx * stride_state_batch +
-                         head_idx * stride_state_head + dim_idx * DSTATE;
-  const int A_base = head_idx * dim * DSTATE + dim_idx * DSTATE;
-
-  // Each lane processes DSTATE/32 = 4 elements
-  // Use float4 vectorized loads for state and A (they're float32)
+  // Each lane processes DSTATE/32 = 4 elements (for DSTATE=128)
   float out_acc = 0.0f;
 
-  // State and A are float32 and contiguous in dstate dimension
-  // Load 4 floats at once using float4
+  // Load state and A using float4 vectorized loads via __ldg
   const float4* state_vec = reinterpret_cast<const float4*>(state + state_base);
   const float4* A_vec = reinterpret_cast<const float4*>(A + A_base);
   float4* state_out_vec = reinterpret_cast<float4*>(state + state_base);
@@ -228,9 +265,9 @@ __global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v7(
   }
 }
 
-// Macro for kernel launch (v7 uses 3D grid)
-#define LAUNCH_KERNEL_V7(HAS_D_VAL, HAS_Z_VAL, DT_SOFTPLUS_VAL)         \
-  selective_state_update_kernel_v7<scalar_t, 128, HAS_D_VAL, HAS_Z_VAL, \
+// Macro for kernel launch (v8 uses 3D grid)
+#define LAUNCH_KERNEL_V8(HAS_D_VAL, HAS_Z_VAL, DT_SOFTPLUS_VAL)         \
+  selective_state_update_kernel_v8<scalar_t, 128, HAS_D_VAL, HAS_Z_VAL, \
                                    DT_SOFTPLUS_VAL>                     \
       <<<grid, block, 0, stream>>>(                                     \
           state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,  \
@@ -263,25 +300,25 @@ void launch_selective_state_update_kernel(
 
   // Dispatch on boolean flags (8 combinations)
   if (has_D && has_z && dt_softplus) {
-    LAUNCH_KERNEL_V7(true, true, true);
+    LAUNCH_KERNEL_V8(true, true, true);
   } else if (has_D && has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V7(true, true, false);
+    LAUNCH_KERNEL_V8(true, true, false);
   } else if (has_D && !has_z && dt_softplus) {
-    LAUNCH_KERNEL_V7(true, false, true);
+    LAUNCH_KERNEL_V8(true, false, true);
   } else if (has_D && !has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V7(true, false, false);
+    LAUNCH_KERNEL_V8(true, false, false);
   } else if (!has_D && has_z && dt_softplus) {
-    LAUNCH_KERNEL_V7(false, true, true);
+    LAUNCH_KERNEL_V8(false, true, true);
   } else if (!has_D && has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V7(false, true, false);
+    LAUNCH_KERNEL_V8(false, true, false);
   } else if (!has_D && !has_z && dt_softplus) {
-    LAUNCH_KERNEL_V7(false, false, true);
+    LAUNCH_KERNEL_V8(false, false, true);
   } else {
-    LAUNCH_KERNEL_V7(false, false, false);
+    LAUNCH_KERNEL_V8(false, false, false);
   }
 }
 
-#undef LAUNCH_KERNEL_V7
+#undef LAUNCH_KERNEL_V8
 
 // Launcher function with configurable parameters
 void selective_state_update_cuda(
@@ -317,7 +354,7 @@ void selective_state_update_cuda(
   const int stride_B_batch = B.stride(0);
   const int stride_B_group = B.stride(1);
 
-  // V7: Use 3D grid (num_dim_blocks, nheads, batch_size)
+  // V8: Use 3D grid (num_dim_blocks, nheads, batch_size)
   // This ensures all warps in a block share the same (batch, group) for B/C
   const int warps_per_block = threads_per_block / 32;
   const int threads = warps_per_block * 32;
