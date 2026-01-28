@@ -2,11 +2,12 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
 // Optimized Mamba SSM decode kernel for Blackwell (B200) and newer GPUs.
-// V6 kernel: Thread-per-element approach (like Triton)
+// V4 kernel: Warp-per-element approach with coalesced memory access
 // Key optimizations:
-// 1. One thread per (batch, head, dim) element - simpler, no warp reduction
+// 1. One warp per (batch, head, dim) element - 32 threads cooperate
 // 2. Vectorized float4 loads for state and A tensors
-// 3. Sequential loop over dstate dimension with unrolling
+// 3. __ldg intrinsics for read-only data
+// 4. Warp shuffle for efficient reduction
 
 #include "selective_state_update.h"
 
@@ -20,6 +21,15 @@
 
 namespace vllm {
 namespace mamba {
+
+// Warp-level reduction using shuffle
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    val += __shfl_down_sync(0xffffffff, val, offset);
+  }
+  return val;
+}
 
 // Softplus function
 __device__ __forceinline__ float softplus(float x) {
@@ -47,14 +57,12 @@ __device__ __forceinline__ float to_float(at::BFloat16 val) {
   return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&val));
 }
 
-// V6 Kernel: Thread-per-element like Triton
-// Each thread processes one (batch, head, dim) element, looping over dstate
-// No warp shuffle needed - simpler and matches Triton's approach
-// Grid: (num_elements / threads_per_block)
-// This gives better occupancy and hides memory latency through more threads
+// V4 Kernel: Each warp processes one (batch, head, dim) element
+// 32 threads cooperate on the dstate dimension (128 elements / 32 = 4 each)
+// Uses vectorized float4 loads for coalesced memory access
 template <typename input_t, int DSTATE, bool HAS_D, bool HAS_Z,
           bool DT_SOFTPLUS>
-__global__ void selective_state_update_kernel_v6(
+__global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v4(
     float* __restrict__ state,            // [batch, nheads, dim, dstate]
     const input_t* __restrict__ x,        // [batch, nheads, dim]
     const input_t* __restrict__ dt,       // [batch, nheads, dim]
@@ -70,27 +78,32 @@ __global__ void selective_state_update_kernel_v6(
     // Strides
     int stride_state_batch, int stride_state_head, int stride_x_batch,
     int stride_x_head, int stride_B_batch, int stride_B_group) {
-  // Each thread handles one (batch, head, dim) element
-  const int elem_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (elem_idx >= total_elements) return;
+  // Which warp am I in (globally)?
+  const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  // Lane within warp (0-31)
+  const int lane_id = threadIdx.x % 32;
 
-  // Decompose element index into (batch, head, dim)
-  const int dim_idx = elem_idx % dim;
-  const int head_idx = (elem_idx / dim) % nheads;
-  const int batch_idx = elem_idx / (dim * nheads);
+  if (warp_id >= total_elements) return;
+
+  // Decompose warp_id into (batch, head, dim)
+  const int dim_idx = warp_id % dim;
+  const int head_idx = (warp_id / dim) % nheads;
+  const int batch_idx = warp_id / (dim * nheads);
+
+  // Which group does this head belong to?
   const int group_idx = head_idx / heads_per_group;
 
   // Input offset for this (batch, head, dim)
   const int x_offset =
       batch_idx * stride_x_batch + head_idx * stride_x_head + dim_idx;
 
-  // Load scalar inputs
-  float x_val = to_float(x[x_offset]);
-  float dt_val = to_float(dt[x_offset]);
+  // Load scalar inputs using __ldg for read-only data
+  float x_val = to_float(__ldg(&x[x_offset]));
+  float dt_val = to_float(__ldg(&dt[x_offset]));
 
   // Add dt_bias if present
   if (dt_bias != nullptr) {
-    dt_val += to_float(dt_bias[head_idx * dim + dim_idx]);
+    dt_val += to_float(__ldg(&dt_bias[head_idx * dim + dim_idx]));
   }
 
   // Apply softplus to dt
@@ -101,79 +114,94 @@ __global__ void selective_state_update_kernel_v6(
   // Load z if present
   float z_val = 0.0f;
   if constexpr (HAS_Z) {
-    z_val = to_float(z[x_offset]);
+    z_val = to_float(__ldg(&z[x_offset]));
   }
 
   // Load D if present
   float d_val = 0.0f;
   if constexpr (HAS_D) {
-    d_val = to_float(D[head_idx * dim + dim_idx]);
+    d_val = to_float(__ldg(&D[head_idx * dim + dim_idx]));
   }
 
   // State and A base offsets
   const int state_base = batch_idx * stride_state_batch +
                          head_idx * stride_state_head + dim_idx * DSTATE;
   const int A_base = head_idx * dim * DSTATE + dim_idx * DSTATE;
+
+  // B and C offset for this batch and group
   const int bc_offset = batch_idx * stride_B_batch + group_idx * stride_B_group;
 
-  // Process dstate elements sequentially using float4 loads
+  // Each lane processes DSTATE/32 = 4 elements
+  // Use float4 vectorized loads for state and A (they're float32)
   float out_acc = 0.0f;
-  float4* state_ptr = reinterpret_cast<float4*>(state + state_base);
-  const float4* A_ptr = reinterpret_cast<const float4*>(A + A_base);
 
-  // 128 elements / 4 per float4 = 32 iterations
-#pragma unroll 8
-  for (int n = 0; n < DSTATE / 4; n++) {
-    float4 state_f4 = state_ptr[n];
-    float4 A_f4 = A_ptr[n];
+  // State and A are float32 and contiguous in dstate dimension
+  // Load 4 floats at once using float4
+  const float4* state_vec = reinterpret_cast<const float4*>(state + state_base);
+  const float4* A_vec = reinterpret_cast<const float4*>(A + A_base);
+  float4* state_out_vec = reinterpret_cast<float4*>(state + state_base);
 
-    // Load B and C for these 4 dstate positions
-    float B0 = to_float(B[bc_offset + n * 4 + 0]);
-    float B1 = to_float(B[bc_offset + n * 4 + 1]);
-    float B2 = to_float(B[bc_offset + n * 4 + 2]);
-    float B3 = to_float(B[bc_offset + n * 4 + 3]);
+  // Each lane handles one float4 (4 consecutive dstate elements)
+  // lane_id 0-31 handles elements 0-3, 4-7, ..., 124-127
+  float4 state_f4 = __ldg(&state_vec[lane_id]);
+  float4 A_f4 = __ldg(&A_vec[lane_id]);
 
-    float C0 = to_float(C[bc_offset + n * 4 + 0]);
-    float C1 = to_float(C[bc_offset + n * 4 + 1]);
-    float C2 = to_float(C[bc_offset + n * 4 + 2]);
-    float C3 = to_float(C[bc_offset + n * 4 + 3]);
-
-    // Compute dA and update state
-    float dA0 = expf(A_f4.x * dt_val);
-    float dA1 = expf(A_f4.y * dt_val);
-    float dA2 = expf(A_f4.z * dt_val);
-    float dA3 = expf(A_f4.w * dt_val);
-
-    float new_state0 = state_f4.x * dA0 + B0 * dt_val * x_val;
-    float new_state1 = state_f4.y * dA1 + B1 * dt_val * x_val;
-    float new_state2 = state_f4.z * dA2 + B2 * dt_val * x_val;
-    float new_state3 = state_f4.w * dA3 + B3 * dt_val * x_val;
-
-    // Store updated state
-    state_ptr[n] = make_float4(new_state0, new_state1, new_state2, new_state3);
-
-    // Accumulate output
-    out_acc +=
-        new_state0 * C0 + new_state1 * C1 + new_state2 * C2 + new_state3 * C3;
+  // Load B and C (may be bf16/fp16, need scalar loads and conversion)
+  float B_vals[4], C_vals[4];
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    int n = lane_id * 4 + i;
+    B_vals[i] = to_float(__ldg(&B[bc_offset + n]));
+    C_vals[i] = to_float(__ldg(&C[bc_offset + n]));
   }
 
-  // Add skip connection
-  if constexpr (HAS_D) {
-    out_acc += x_val * d_val;
+  // Process 4 elements per lane
+  float state_vals[4] = {state_f4.x, state_f4.y, state_f4.z, state_f4.w};
+  float A_vals[4] = {A_f4.x, A_f4.y, A_f4.z, A_f4.w};
+
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    // dA = exp(A * dt)
+    float dA = expf(A_vals[i] * dt_val);
+
+    // dB = B * dt
+    float dB = B_vals[i] * dt_val;
+
+    // Update state: state = state * dA + dB * x
+    state_vals[i] = state_vals[i] * dA + dB * x_val;
+
+    // Accumulate output: out += state * C
+    out_acc += state_vals[i] * C_vals[i];
   }
 
-  // Apply gating
-  if constexpr (HAS_Z) {
-    out_acc *= z_val * fast_sigmoid(z_val);
-  }
+  // Store updated state using float4
+  float4 state_out =
+      make_float4(state_vals[0], state_vals[1], state_vals[2], state_vals[3]);
+  state_out_vec[lane_id] = state_out;
 
-  // Store output
-  out[x_offset] = static_cast<input_t>(out_acc);
+  // Warp-level reduction to sum out_acc across all lanes
+  out_acc = warp_reduce_sum(out_acc);
+
+  // Lane 0 writes the final output
+  if (lane_id == 0) {
+    // Add skip connection
+    if constexpr (HAS_D) {
+      out_acc += x_val * d_val;
+    }
+
+    // Apply gating
+    if constexpr (HAS_Z) {
+      out_acc *= z_val * fast_sigmoid(z_val);
+    }
+
+    // Store output
+    out[x_offset] = static_cast<input_t>(out_acc);
+  }
 }
 
-// Macro for kernel launch (v6 uses 1D grid, one thread per element)
-#define LAUNCH_KERNEL_V6(HAS_D_VAL, HAS_Z_VAL, DT_SOFTPLUS_VAL)         \
-  selective_state_update_kernel_v6<scalar_t, 128, HAS_D_VAL, HAS_Z_VAL, \
+// Macro for kernel launch
+#define LAUNCH_KERNEL_V4(HAS_D_VAL, HAS_Z_VAL, DT_SOFTPLUS_VAL)         \
+  selective_state_update_kernel_v4<scalar_t, 128, HAS_D_VAL, HAS_Z_VAL, \
                                    DT_SOFTPLUS_VAL>                     \
       <<<grid, block, 0, stream>>>(                                     \
           state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,  \
@@ -206,25 +234,25 @@ void launch_selective_state_update_kernel(
 
   // Dispatch on boolean flags (8 combinations)
   if (has_D && has_z && dt_softplus) {
-    LAUNCH_KERNEL_V6(true, true, true);
+    LAUNCH_KERNEL_V4(true, true, true);
   } else if (has_D && has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V6(true, true, false);
+    LAUNCH_KERNEL_V4(true, true, false);
   } else if (has_D && !has_z && dt_softplus) {
-    LAUNCH_KERNEL_V6(true, false, true);
+    LAUNCH_KERNEL_V4(true, false, true);
   } else if (has_D && !has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V6(true, false, false);
+    LAUNCH_KERNEL_V4(true, false, false);
   } else if (!has_D && has_z && dt_softplus) {
-    LAUNCH_KERNEL_V6(false, true, true);
+    LAUNCH_KERNEL_V4(false, true, true);
   } else if (!has_D && has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V6(false, true, false);
+    LAUNCH_KERNEL_V4(false, true, false);
   } else if (!has_D && !has_z && dt_softplus) {
-    LAUNCH_KERNEL_V6(false, false, true);
+    LAUNCH_KERNEL_V4(false, false, true);
   } else {
-    LAUNCH_KERNEL_V6(false, false, false);
+    LAUNCH_KERNEL_V4(false, false, false);
   }
 }
 
-#undef LAUNCH_KERNEL_V6
+#undef LAUNCH_KERNEL_V4
 
 // Launcher function with configurable parameters
 void selective_state_update_cuda(
@@ -245,9 +273,8 @@ void selective_state_update_cuda(
   // Validate dimensions
   TORCH_CHECK(nheads % ngroups == 0, "nheads must be divisible by ngroups");
   TORCH_CHECK(dstate == 128, "This kernel requires dstate=128, got ", dstate);
-  // V6 allows up to 1024 threads (no __syncthreads__ needed)
-  TORCH_CHECK(threads_per_block >= 32 && threads_per_block <= 1024,
-              "threads_per_block must be between 32 and 1024, got ",
+  TORCH_CHECK(threads_per_block >= 32 && threads_per_block <= 256,
+              "threads_per_block must be between 32 and 256, got ",
               threads_per_block);
   TORCH_CHECK(threads_per_block % 32 == 0,
               "threads_per_block must be a multiple of 32, got ",
@@ -261,10 +288,14 @@ void selective_state_update_cuda(
   const int stride_B_batch = B.stride(0);
   const int stride_B_group = B.stride(1);
 
-  // V6: Simple 1D grid, one thread per element
+  // Total elements: each warp handles one (batch, head, dim)
   const int total_elements = batch_size * nheads * dim;
-  const int threads = threads_per_block;
-  const int num_blocks = (total_elements + threads - 1) / threads;
+
+  // Use warps_per_block from threads_per_block (must be multiple of 32)
+  const int warps_per_block = threads_per_block / 32;
+  const int threads = warps_per_block * 32;
+  const int num_blocks =
+      (total_elements + warps_per_block - 1) / warps_per_block;
 
   dim3 grid(num_blocks);
   dim3 block(threads);
