@@ -190,6 +190,59 @@ __global__ void selective_state_update_kernel(
   }
 }
 
+// Helper template function for kernel dispatch
+template <typename scalar_t>
+void launch_selective_state_update_kernel(
+    float* state_ptr, const float* A_ptr, const torch::Tensor& x,
+    const torch::Tensor& dt, const torch::Tensor& B, const torch::Tensor& C,
+    const c10::optional<torch::Tensor>& D,
+    const c10::optional<torch::Tensor>& z,
+    const c10::optional<torch::Tensor>& dt_bias, torch::Tensor& out, bool has_D,
+    bool has_z, bool dt_softplus, int batch_size, int nheads, int ngroups,
+    int stride_state_batch, int stride_state_head, int stride_x_batch,
+    int stride_x_head, int stride_B_batch, int stride_B_group, dim3 grid,
+    dim3 block, cudaStream_t stream) {
+  const scalar_t* x_ptr = x.data_ptr<scalar_t>();
+  const scalar_t* dt_ptr = dt.data_ptr<scalar_t>();
+  const scalar_t* B_ptr = B.data_ptr<scalar_t>();
+  const scalar_t* C_ptr = C.data_ptr<scalar_t>();
+  const scalar_t* D_ptr = has_D ? D.value().data_ptr<scalar_t>() : nullptr;
+  const scalar_t* z_ptr = has_z ? z.value().data_ptr<scalar_t>() : nullptr;
+  const scalar_t* dt_bias_ptr =
+      dt_bias.has_value() ? dt_bias.value().data_ptr<scalar_t>() : nullptr;
+  scalar_t* out_ptr = out.data_ptr<scalar_t>();
+
+// Macro for launching kernel with specific boolean template params
+#define LAUNCH_KERNEL(HAS_D_VAL, HAS_Z_VAL, DT_SOFTPLUS_VAL)                  \
+  selective_state_update_kernel<scalar_t, 64, 128, HAS_D_VAL, HAS_Z_VAL,      \
+                                DT_SOFTPLUS_VAL><<<grid, block, 0, stream>>>( \
+      state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,            \
+      dt_bias_ptr, out_ptr, batch_size, nheads, ngroups, stride_state_batch,  \
+      stride_state_head, stride_x_batch, stride_x_head, stride_B_batch,       \
+      stride_B_group)
+
+  // Dispatch on boolean flags (8 combinations)
+  if (has_D && has_z && dt_softplus) {
+    LAUNCH_KERNEL(true, true, true);
+  } else if (has_D && has_z && !dt_softplus) {
+    LAUNCH_KERNEL(true, true, false);
+  } else if (has_D && !has_z && dt_softplus) {
+    LAUNCH_KERNEL(true, false, true);
+  } else if (has_D && !has_z && !dt_softplus) {
+    LAUNCH_KERNEL(true, false, false);
+  } else if (!has_D && has_z && dt_softplus) {
+    LAUNCH_KERNEL(false, true, true);
+  } else if (!has_D && has_z && !dt_softplus) {
+    LAUNCH_KERNEL(false, true, false);
+  } else if (!has_D && !has_z && dt_softplus) {
+    LAUNCH_KERNEL(false, false, true);
+  } else {
+    LAUNCH_KERNEL(false, false, false);
+  }
+
+#undef LAUNCH_KERNEL
+}
+
 // Launcher function
 void selective_state_update_cuda(torch::Tensor& state, const torch::Tensor& x,
                                  const torch::Tensor& dt,
@@ -210,6 +263,9 @@ void selective_state_update_cuda(torch::Tensor& state, const torch::Tensor& x,
   TORCH_CHECK(nheads % ngroups == 0, "nheads must be divisible by ngroups");
   TORCH_CHECK(nheads / ngroups == HEADS_PER_GROUP,
               "This kernel is optimized for nheads/ngroups == 8");
+  TORCH_CHECK(dim == 64 && dstate == 128,
+              "Unsupported dim/dstate combination: ", dim, "/", dstate,
+              ". This kernel is optimized for dim=64, dstate=128.");
 
   // Get strides
   const int stride_state_batch = state.stride(0);
@@ -234,58 +290,28 @@ void selective_state_update_cuda(torch::Tensor& state, const torch::Tensor& x,
   float* state_ptr = state.data_ptr<float>();
   const float* A_ptr = A.data_ptr<float>();
 
-  // Dispatch based on input type and flags
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(),
-      "selective_state_update_cuda", [&] {
-        const scalar_t* x_ptr = x.data_ptr<scalar_t>();
-        const scalar_t* dt_ptr = dt.data_ptr<scalar_t>();
-        const scalar_t* B_ptr = B.data_ptr<scalar_t>();
-        const scalar_t* C_ptr = C.data_ptr<scalar_t>();
-        const scalar_t* D_ptr =
-            has_D ? D.value().data_ptr<scalar_t>() : nullptr;
-        const scalar_t* z_ptr =
-            has_z ? z.value().data_ptr<scalar_t>() : nullptr;
-        const scalar_t* dt_bias_ptr = dt_bias.has_value()
-                                          ? dt_bias.value().data_ptr<scalar_t>()
-                                          : nullptr;
-        scalar_t* out_ptr = out.data_ptr<scalar_t>();
-
-// Dispatch based on dimensions and flags
-// For now, support common configurations
-#define LAUNCH_KERNEL(DIM_VAL, DSTATE_VAL, HAS_D_VAL, HAS_Z_VAL,          \
-                      DT_SOFTPLUS_VAL)                                    \
-  selective_state_update_kernel<scalar_t, DIM_VAL, DSTATE_VAL, HAS_D_VAL, \
-                                HAS_Z_VAL, DT_SOFTPLUS_VAL>               \
-      <<<grid, block, 0, stream>>>(                                       \
-          state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,    \
-          dt_bias_ptr, out_ptr, batch_size, nheads, ngroups,              \
-          stride_state_batch, stride_state_head, stride_x_batch,          \
-          stride_x_head, stride_B_batch, stride_B_group);
-
-        // Common case: dim=64, dstate=128 (Nemotron-H)
-        if (dim == 64 && dstate == 128) {
-          if (has_D && has_z && dt_softplus) {
-            LAUNCH_KERNEL(64, 128, true, true, true);
-          } else if (has_D && has_z && !dt_softplus) {
-            LAUNCH_KERNEL(64, 128, true, true, false);
-          } else if (has_D && !has_z && dt_softplus) {
-            LAUNCH_KERNEL(64, 128, true, false, true);
-          } else if (!has_D && has_z && dt_softplus) {
-            LAUNCH_KERNEL(64, 128, false, true, true);
-          } else if (!has_D && !has_z && dt_softplus) {
-            LAUNCH_KERNEL(64, 128, false, false, true);
-          } else {
-            LAUNCH_KERNEL(64, 128, false, false, false);
-          }
-        } else {
-          TORCH_CHECK(false, "Unsupported dim/dstate combination: ", dim, "/",
-                      dstate,
-                      ". This kernel is optimized for dim=64, dstate=128.");
-        }
-
-#undef LAUNCH_KERNEL
-      });
+  // Dispatch based on input type
+  if (x.scalar_type() == at::ScalarType::Half) {
+    launch_selective_state_update_kernel<at::Half>(
+        state_ptr, A_ptr, x, dt, B, C, D, z, dt_bias, out, has_D, has_z,
+        dt_softplus, batch_size, nheads, ngroups, stride_state_batch,
+        stride_state_head, stride_x_batch, stride_x_head, stride_B_batch,
+        stride_B_group, grid, block, stream);
+  } else if (x.scalar_type() == at::ScalarType::BFloat16) {
+    launch_selective_state_update_kernel<at::BFloat16>(
+        state_ptr, A_ptr, x, dt, B, C, D, z, dt_bias, out, has_D, has_z,
+        dt_softplus, batch_size, nheads, ngroups, stride_state_batch,
+        stride_state_head, stride_x_batch, stride_x_head, stride_B_batch,
+        stride_B_group, grid, block, stream);
+  } else if (x.scalar_type() == at::ScalarType::Float) {
+    launch_selective_state_update_kernel<float>(
+        state_ptr, A_ptr, x, dt, B, C, D, z, dt_bias, out, has_D, has_z,
+        dt_softplus, batch_size, nheads, ngroups, stride_state_batch,
+        stride_state_head, stride_x_batch, stride_x_head, stride_B_batch,
+        stride_B_group, grid, block, stream);
+  } else {
+    TORCH_CHECK(false, "Unsupported input dtype: ", x.scalar_type());
+  }
 
   // Check for errors
   C10_CUDA_KERNEL_LAUNCH_CHECK();
