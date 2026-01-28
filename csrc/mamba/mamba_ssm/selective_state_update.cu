@@ -6,6 +6,7 @@
 // 1. Warp-level cooperation over dstate dimension
 // 2. Vectorized float4 loads for better memory bandwidth
 // 3. __ldg intrinsics for read-only data
+// 4. Shared memory for B and C tensors (v5) - reduces memory traffic 8x
 
 #include "selective_state_update.h"
 
@@ -55,13 +56,14 @@ __device__ __forceinline__ float to_float(at::BFloat16 val) {
   return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&val));
 }
 
-// Main kernel: Each warp processes one (batch, head, dim) element
-// Uses vectorized float4 loads for state and A tensors
-// Threads cooperate on the dstate dimension (128 elements / 32 threads = 4
-// each)
+// V5 Kernel: Uses shared memory for B and C to reduce memory traffic
+// Grid: (num_dim_blocks, nheads, batch_size)
+// Each block processes warps_per_block consecutive dim elements for one
+// (batch, head) All warps in a block share the same (batch, group), so B and C
+// are loaded once
 template <typename input_t, int DSTATE, bool HAS_D, bool HAS_Z,
           bool DT_SOFTPLUS>
-__global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v4(
+__global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v5(
     float* __restrict__ state,            // [batch, nheads, dim, dstate]
     const input_t* __restrict__ x,        // [batch, nheads, dim]
     const input_t* __restrict__ dt,       // [batch, nheads, dim]
@@ -72,25 +74,39 @@ __global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v4(
     const input_t* __restrict__ z,        // [batch, nheads, dim] or nullptr
     const input_t* __restrict__ dt_bias,  // [nheads, dim] or nullptr
     input_t* __restrict__ out,            // [batch, nheads, dim]
-    int total_elements,                   // batch * nheads * dim
     int dim, int nheads, int ngroups, int heads_per_group,
     // Strides
     int stride_state_batch, int stride_state_head, int stride_x_batch,
     int stride_x_head, int stride_B_batch, int stride_B_group) {
-  // Which warp am I in (globally)?
-  const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-  // Lane within warp (0-31)
+  // Shared memory for B and C (128 floats each = 1KB total)
+  __shared__ float shared_B[DSTATE];
+  __shared__ float shared_C[DSTATE];
+
+  // Grid: (num_dim_blocks, nheads, batch_size)
+  const int dim_block_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  const int batch_idx = blockIdx.z;
+  const int group_idx = head_idx / heads_per_group;
+
+  const int warps_per_block = blockDim.x / 32;
+  const int local_warp_id = threadIdx.x / 32;
   const int lane_id = threadIdx.x % 32;
 
-  if (warp_id >= total_elements) return;
+  const int dim_idx = dim_block_idx * warps_per_block + local_warp_id;
 
-  // Decompose warp_id into (batch, head, dim)
-  const int dim_idx = warp_id % dim;
-  const int head_idx = (warp_id / dim) % nheads;
-  const int batch_idx = warp_id / (dim * nheads);
+  // B/C offset for this block
+  const int bc_offset = batch_idx * stride_B_batch + group_idx * stride_B_group;
 
-  // Which group does this head belong to?
-  const int group_idx = head_idx / heads_per_group;
+  // Cooperative loading of B and C into shared memory
+  // All threads participate to maximize memory bandwidth
+  for (int i = threadIdx.x; i < DSTATE; i += blockDim.x) {
+    shared_B[i] = to_float(__ldg(&B[bc_offset + i]));
+    shared_C[i] = to_float(__ldg(&C[bc_offset + i]));
+  }
+  __syncthreads();
+
+  // Early exit for out-of-bounds warps
+  if (dim_idx >= dim) return;
 
   // Input offset for this (batch, head, dim)
   const int x_offset =
@@ -127,9 +143,6 @@ __global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v4(
                          head_idx * stride_state_head + dim_idx * DSTATE;
   const int A_base = head_idx * dim * DSTATE + dim_idx * DSTATE;
 
-  // B and C offset for this batch and group
-  const int bc_offset = batch_idx * stride_B_batch + group_idx * stride_B_group;
-
   // Each lane processes DSTATE/32 = 4 elements
   // Use float4 vectorized loads for state and A (they're float32)
   float out_acc = 0.0f;
@@ -141,17 +154,16 @@ __global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v4(
   float4* state_out_vec = reinterpret_cast<float4*>(state + state_base);
 
   // Each lane handles one float4 (4 consecutive dstate elements)
-  // lane_id 0-31 handles elements 0-3, 4-7, ..., 124-127
   float4 state_f4 = __ldg(&state_vec[lane_id]);
   float4 A_f4 = __ldg(&A_vec[lane_id]);
 
-  // Load B and C (may be bf16/fp16, need scalar loads and conversion)
+  // Read B and C from shared memory (already converted to float)
   float B_vals[4], C_vals[4];
 #pragma unroll
   for (int i = 0; i < 4; i++) {
     int n = lane_id * 4 + i;
-    B_vals[i] = to_float(__ldg(&B[bc_offset + n]));
-    C_vals[i] = to_float(__ldg(&C[bc_offset + n]));
+    B_vals[i] = shared_B[n];
+    C_vals[i] = shared_C[n];
   }
 
   // Process 4 elements per lane
@@ -198,15 +210,15 @@ __global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v4(
   }
 }
 
-// Macro for kernel launch
-#define LAUNCH_KERNEL_V4(HAS_D_VAL, HAS_Z_VAL, DT_SOFTPLUS_VAL)         \
-  selective_state_update_kernel_v4<scalar_t, 128, HAS_D_VAL, HAS_Z_VAL, \
+// Macro for kernel launch (v5 uses 3D grid)
+#define LAUNCH_KERNEL_V5(HAS_D_VAL, HAS_Z_VAL, DT_SOFTPLUS_VAL)         \
+  selective_state_update_kernel_v5<scalar_t, 128, HAS_D_VAL, HAS_Z_VAL, \
                                    DT_SOFTPLUS_VAL>                     \
       <<<grid, block, 0, stream>>>(                                     \
           state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,  \
-          dt_bias_ptr, out_ptr, total_elements, dim, nheads, ngroups,   \
-          heads_per_group, stride_state_batch, stride_state_head,       \
-          stride_x_batch, stride_x_head, stride_B_batch, stride_B_group)
+          dt_bias_ptr, out_ptr, dim, nheads, ngroups, heads_per_group,  \
+          stride_state_batch, stride_state_head, stride_x_batch,        \
+          stride_x_head, stride_B_batch, stride_B_group)
 
 // Helper template function for kernel dispatch
 template <typename scalar_t>
@@ -217,10 +229,10 @@ void launch_selective_state_update_kernel(
     const c10::optional<torch::Tensor>& z,
     const c10::optional<torch::Tensor>& dt_bias, torch::Tensor& out, bool has_D,
     bool has_z, bool dt_softplus, int batch_size, int nheads, int dim,
-    int ngroups, int heads_per_group, int total_elements,
-    int stride_state_batch, int stride_state_head, int stride_x_batch,
-    int stride_x_head, int stride_B_batch, int stride_B_group, dim3 grid,
-    dim3 block, cudaStream_t stream) {
+    int ngroups, int heads_per_group, int stride_state_batch,
+    int stride_state_head, int stride_x_batch, int stride_x_head,
+    int stride_B_batch, int stride_B_group, dim3 grid, dim3 block,
+    cudaStream_t stream) {
   const scalar_t* x_ptr = x.data_ptr<scalar_t>();
   const scalar_t* dt_ptr = dt.data_ptr<scalar_t>();
   const scalar_t* B_ptr = B.data_ptr<scalar_t>();
@@ -233,25 +245,25 @@ void launch_selective_state_update_kernel(
 
   // Dispatch on boolean flags (8 combinations)
   if (has_D && has_z && dt_softplus) {
-    LAUNCH_KERNEL_V4(true, true, true);
+    LAUNCH_KERNEL_V5(true, true, true);
   } else if (has_D && has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V4(true, true, false);
+    LAUNCH_KERNEL_V5(true, true, false);
   } else if (has_D && !has_z && dt_softplus) {
-    LAUNCH_KERNEL_V4(true, false, true);
+    LAUNCH_KERNEL_V5(true, false, true);
   } else if (has_D && !has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V4(true, false, false);
+    LAUNCH_KERNEL_V5(true, false, false);
   } else if (!has_D && has_z && dt_softplus) {
-    LAUNCH_KERNEL_V4(false, true, true);
+    LAUNCH_KERNEL_V5(false, true, true);
   } else if (!has_D && has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V4(false, true, false);
+    LAUNCH_KERNEL_V5(false, true, false);
   } else if (!has_D && !has_z && dt_softplus) {
-    LAUNCH_KERNEL_V4(false, false, true);
+    LAUNCH_KERNEL_V5(false, false, true);
   } else {
-    LAUNCH_KERNEL_V4(false, false, false);
+    LAUNCH_KERNEL_V5(false, false, false);
   }
 }
 
-#undef LAUNCH_KERNEL_V4
+#undef LAUNCH_KERNEL_V5
 
 // Launcher function with configurable parameters
 void selective_state_update_cuda(
@@ -287,16 +299,13 @@ void selective_state_update_cuda(
   const int stride_B_batch = B.stride(0);
   const int stride_B_group = B.stride(1);
 
-  // Total elements: each warp handles one (batch, head, dim)
-  const int total_elements = batch_size * nheads * dim;
-
-  // Use warps_per_block from threads_per_block (must be multiple of 32)
+  // V5: Use 3D grid (num_dim_blocks, nheads, batch_size)
+  // This ensures all warps in a block share the same (batch, group) for B/C
   const int warps_per_block = threads_per_block / 32;
   const int threads = warps_per_block * 32;
-  const int num_blocks =
-      (total_elements + warps_per_block - 1) / warps_per_block;
+  const int num_dim_blocks = (dim + warps_per_block - 1) / warps_per_block;
 
-  dim3 grid(num_blocks);
+  dim3 grid(num_dim_blocks, nheads, batch_size);
   dim3 block(threads);
 
   // Get CUDA stream
@@ -315,20 +324,20 @@ void selective_state_update_cuda(
     launch_selective_state_update_kernel<at::Half>(
         state_ptr, A_ptr, x, dt, B, C, D, z, dt_bias, out, has_D, has_z,
         dt_softplus, batch_size, nheads, dim, ngroups, heads_per_group,
-        total_elements, stride_state_batch, stride_state_head, stride_x_batch,
-        stride_x_head, stride_B_batch, stride_B_group, grid, block, stream);
+        stride_state_batch, stride_state_head, stride_x_batch, stride_x_head,
+        stride_B_batch, stride_B_group, grid, block, stream);
   } else if (x.scalar_type() == at::ScalarType::BFloat16) {
     launch_selective_state_update_kernel<at::BFloat16>(
         state_ptr, A_ptr, x, dt, B, C, D, z, dt_bias, out, has_D, has_z,
         dt_softplus, batch_size, nheads, dim, ngroups, heads_per_group,
-        total_elements, stride_state_batch, stride_state_head, stride_x_batch,
-        stride_x_head, stride_B_batch, stride_B_group, grid, block, stream);
+        stride_state_batch, stride_state_head, stride_x_batch, stride_x_head,
+        stride_B_batch, stride_B_group, grid, block, stream);
   } else if (x.scalar_type() == at::ScalarType::Float) {
     launch_selective_state_update_kernel<float>(
         state_ptr, A_ptr, x, dt, B, C, D, z, dt_bias, out, has_D, has_z,
         dt_softplus, batch_size, nheads, dim, ngroups, heads_per_group,
-        total_elements, stride_state_batch, stride_state_head, stride_x_batch,
-        stride_x_head, stride_B_batch, stride_B_group, grid, block, stream);
+        stride_state_batch, stride_state_head, stride_x_batch, stride_x_head,
+        stride_B_batch, stride_B_group, grid, block, stream);
   } else {
     TORCH_CHECK(false, "Unsupported input dtype: ", x.scalar_type());
   }
