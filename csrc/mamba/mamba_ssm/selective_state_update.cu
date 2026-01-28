@@ -2,9 +2,10 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
 // Optimized Mamba SSM decode kernel for Blackwell (B200) and newer GPUs.
-// Key optimization: Parallelize over dstate using warp-level cooperation.
-// Each warp processes one (batch, head, dim) element, with threads
-// cooperating to process the 128 dstate values in parallel.
+// Key optimizations:
+// 1. Warp-level cooperation over dstate dimension
+// 2. Vectorized float4 loads for better memory bandwidth
+// 3. __ldg intrinsics for read-only data
 
 #include "selective_state_update.h"
 
@@ -33,18 +34,34 @@ __device__ __forceinline__ float softplus(float x) {
   return x > 20.0f ? x : logf(expf(x) + 1.0f);
 }
 
-// Fast sigmoid
+// Fast sigmoid using intrinsic
 __device__ __forceinline__ float fast_sigmoid(float x) {
-  return 1.0f / (1.0f + expf(-x));
+  return __frcp_rn(1.0f + expf(-x));
+}
+
+// Convert input type to float
+template <typename T>
+__device__ __forceinline__ float to_float(T val) {
+  return static_cast<float>(val);
+}
+
+template <>
+__device__ __forceinline__ float to_float(at::Half val) {
+  return __half2float(val);
+}
+
+template <>
+__device__ __forceinline__ float to_float(at::BFloat16 val) {
+  return __bfloat162float(val);
 }
 
 // Main kernel: Each warp processes one (batch, head, dim) element
-// Threads within the warp cooperate on the dstate dimension
-// Grid: (batch * nheads * dim / WARPS_PER_BLOCK, 1, 1)
-// Block: (32 * WARPS_PER_BLOCK, 1, 1)
+// Uses vectorized float4 loads for state and A tensors
+// Threads cooperate on the dstate dimension (128 elements / 32 threads = 4
+// each)
 template <typename input_t, int DSTATE, bool HAS_D, bool HAS_Z,
           bool DT_SOFTPLUS>
-__global__ void selective_state_update_kernel_v3(
+__global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v4(
     float* __restrict__ state,            // [batch, nheads, dim, dstate]
     const input_t* __restrict__ x,        // [batch, nheads, dim]
     const input_t* __restrict__ dt,       // [batch, nheads, dim]
@@ -79,13 +96,13 @@ __global__ void selective_state_update_kernel_v3(
   const int x_offset =
       batch_idx * stride_x_batch + head_idx * stride_x_head + dim_idx;
 
-  // Load scalar inputs (same for all lanes in warp)
-  float x_val = static_cast<float>(x[x_offset]);
-  float dt_val = static_cast<float>(dt[x_offset]);
+  // Load scalar inputs using __ldg for read-only data
+  float x_val = to_float(__ldg(&x[x_offset]));
+  float dt_val = to_float(__ldg(&dt[x_offset]));
 
   // Add dt_bias if present
   if (dt_bias != nullptr) {
-    dt_val += static_cast<float>(dt_bias[head_idx * dim + dim_idx]);
+    dt_val += to_float(__ldg(&dt_bias[head_idx * dim + dim_idx]));
   }
 
   // Apply softplus to dt
@@ -96,13 +113,13 @@ __global__ void selective_state_update_kernel_v3(
   // Load z if present
   float z_val = 0.0f;
   if constexpr (HAS_Z) {
-    z_val = static_cast<float>(z[x_offset]);
+    z_val = to_float(__ldg(&z[x_offset]));
   }
 
   // Load D if present
   float d_val = 0.0f;
   if constexpr (HAS_D) {
-    d_val = static_cast<float>(D[head_idx * dim + dim_idx]);
+    d_val = to_float(__ldg(&D[head_idx * dim + dim_idx]));
   }
 
   // State and A base offsets
@@ -113,35 +130,53 @@ __global__ void selective_state_update_kernel_v3(
   // B and C offset for this batch and group
   const int bc_offset = batch_idx * stride_B_batch + group_idx * stride_B_group;
 
-  // Each lane processes DSTATE/32 = 4 elements (for DSTATE=128)
-  // We process elements: lane_id, lane_id+32, lane_id+64, lane_id+96
+  // Each lane processes DSTATE/32 = 4 elements
+  // Use float4 vectorized loads for state and A (they're float32)
   float out_acc = 0.0f;
 
+  // State and A are float32 and contiguous in dstate dimension
+  // Load 4 floats at once using float4
+  const float4* state_vec = reinterpret_cast<const float4*>(state + state_base);
+  const float4* A_vec = reinterpret_cast<const float4*>(A + A_base);
+  float4* state_out_vec = reinterpret_cast<float4*>(state + state_base);
+
+  // Each lane handles one float4 (4 consecutive dstate elements)
+  // lane_id 0-31 handles elements 0-3, 4-7, ..., 124-127
+  float4 state_f4 = __ldg(&state_vec[lane_id]);
+  float4 A_f4 = __ldg(&A_vec[lane_id]);
+
+  // Load B and C (may be bf16/fp16, need scalar loads and conversion)
+  float B_vals[4], C_vals[4];
 #pragma unroll
-  for (int i = 0; i < DSTATE / 32; i++) {
-    const int n = lane_id + i * 32;
+  for (int i = 0; i < 4; i++) {
+    int n = lane_id * 4 + i;
+    B_vals[i] = to_float(__ldg(&B[bc_offset + n]));
+    C_vals[i] = to_float(__ldg(&C[bc_offset + n]));
+  }
 
-    // Load state, A, B, C for this dstate index
-    float state_val = state[state_base + n];
-    float A_val = A[A_base + n];
-    float B_val = static_cast<float>(B[bc_offset + n]);
-    float C_val = static_cast<float>(C[bc_offset + n]);
+  // Process 4 elements per lane
+  float state_vals[4] = {state_f4.x, state_f4.y, state_f4.z, state_f4.w};
+  float A_vals[4] = {A_f4.x, A_f4.y, A_f4.z, A_f4.w};
 
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
     // dA = exp(A * dt)
-    float dA = expf(A_val * dt_val);
+    float dA = expf(A_vals[i] * dt_val);
 
     // dB = B * dt
-    float dB = B_val * dt_val;
+    float dB = B_vals[i] * dt_val;
 
     // Update state: state = state * dA + dB * x
-    state_val = state_val * dA + dB * x_val;
-
-    // Store updated state
-    state[state_base + n] = state_val;
+    state_vals[i] = state_vals[i] * dA + dB * x_val;
 
     // Accumulate output: out += state * C
-    out_acc += state_val * C_val;
+    out_acc += state_vals[i] * C_vals[i];
   }
+
+  // Store updated state using float4
+  float4 state_out =
+      make_float4(state_vals[0], state_vals[1], state_vals[2], state_vals[3]);
+  state_out_vec[lane_id] = state_out;
 
   // Warp-level reduction to sum out_acc across all lanes
   out_acc = warp_reduce_sum(out_acc);
@@ -164,8 +199,8 @@ __global__ void selective_state_update_kernel_v3(
 }
 
 // Macro for kernel launch
-#define LAUNCH_KERNEL_V3(HAS_D_VAL, HAS_Z_VAL, DT_SOFTPLUS_VAL)         \
-  selective_state_update_kernel_v3<scalar_t, 128, HAS_D_VAL, HAS_Z_VAL, \
+#define LAUNCH_KERNEL_V4(HAS_D_VAL, HAS_Z_VAL, DT_SOFTPLUS_VAL)         \
+  selective_state_update_kernel_v4<scalar_t, 128, HAS_D_VAL, HAS_Z_VAL, \
                                    DT_SOFTPLUS_VAL>                     \
       <<<grid, block, 0, stream>>>(                                     \
           state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,  \
@@ -198,25 +233,25 @@ void launch_selective_state_update_kernel(
 
   // Dispatch on boolean flags (8 combinations)
   if (has_D && has_z && dt_softplus) {
-    LAUNCH_KERNEL_V3(true, true, true);
+    LAUNCH_KERNEL_V4(true, true, true);
   } else if (has_D && has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V3(true, true, false);
+    LAUNCH_KERNEL_V4(true, true, false);
   } else if (has_D && !has_z && dt_softplus) {
-    LAUNCH_KERNEL_V3(true, false, true);
+    LAUNCH_KERNEL_V4(true, false, true);
   } else if (has_D && !has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V3(true, false, false);
+    LAUNCH_KERNEL_V4(true, false, false);
   } else if (!has_D && has_z && dt_softplus) {
-    LAUNCH_KERNEL_V3(false, true, true);
+    LAUNCH_KERNEL_V4(false, true, true);
   } else if (!has_D && has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V3(false, true, false);
+    LAUNCH_KERNEL_V4(false, true, false);
   } else if (!has_D && !has_z && dt_softplus) {
-    LAUNCH_KERNEL_V3(false, false, true);
+    LAUNCH_KERNEL_V4(false, false, true);
   } else {
-    LAUNCH_KERNEL_V3(false, false, false);
+    LAUNCH_KERNEL_V4(false, false, false);
   }
 }
 
-#undef LAUNCH_KERNEL_V3
+#undef LAUNCH_KERNEL_V4
 
 // Launcher function with configurable parameters
 void selective_state_update_cuda(
