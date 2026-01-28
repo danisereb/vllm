@@ -185,10 +185,13 @@ def test_selective_state_update_cuda_correctness(
     )
 
 
+@pytest.mark.parametrize("dims_per_warp", [1, 2, 4, 8])
 @pytest.mark.parametrize("threads_per_block", [64, 128, 256])
 @pytest.mark.parametrize("batch_size", [32, 128])
-def test_selective_state_update_cuda_configs(batch_size, threads_per_block):
-    """Test different kernel configurations."""
+def test_selective_state_update_cuda_configs(
+    batch_size, threads_per_block, dims_per_warp
+):
+    """Test different kernel configurations including dims_per_warp (pipelining)."""
     device = "cuda"
     itype = torch.bfloat16
     rtol, atol = 2e-1, 5.0  # bfloat16 needs loose tolerances
@@ -213,6 +216,7 @@ def test_selective_state_update_cuda_configs(batch_size, threads_per_block):
     state_ref = state.clone()
 
     # Run with specified config
+    # block_size_m now controls dims_per_warp for pipelining
     ops.selective_state_update_cuda(
         state,
         x,
@@ -225,7 +229,7 @@ def test_selective_state_update_cuda_configs(batch_size, threads_per_block):
         dt_bias,
         out,
         dt_softplus=True,
-        block_size_m=32,
+        block_size_m=dims_per_warp,
         threads_per_block=threads_per_block,
     )
 
@@ -234,11 +238,13 @@ def test_selective_state_update_cuda_configs(batch_size, threads_per_block):
     )
 
     assert torch.allclose(state, state_ref, rtol=rtol, atol=atol), (
-        f"State mismatch with threads={threads_per_block}: "
+        f"State mismatch with threads={threads_per_block}, "
+        f"dims_per_warp={dims_per_warp}: "
         f"max diff = {(state - state_ref).abs().max().item()}"
     )
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol), (
-        f"Output mismatch with threads={threads_per_block}: "
+        f"Output mismatch with threads={threads_per_block}, "
+        f"dims_per_warp={dims_per_warp}: "
         f"max diff = {(out - out_ref).abs().max().item()}"
     )
 

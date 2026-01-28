@@ -2,18 +2,14 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
 // Optimized Mamba SSM decode kernel for Blackwell (B200) and newer GPUs.
-// V8 kernel with optional TMA (Tensor Memory Accelerator) for SM 9.0+
-//
-// Two modes:
-// 1. Standard mode (SM < 9.0): Cooperative loads with shared memory
-// 2. TMA mode (SM >= 9.0): True async bulk copies with mbarrier
+// V9 kernel: Software pipelining for improved memory latency hiding
 //
 // Key optimizations:
-// 1. cp.async.bulk for TMA loads (SM 9.0+)
-// 2. mbarrier for async completion tracking
-// 3. 3D grid for B/C sharing
-// 4. Warp-level cooperation over dstate
-// 5. Vectorized float4 loads/stores
+// 1. Each warp processes MULTIPLE dim elements sequentially (DIMS_PER_WARP)
+// 2. Software pipelining: prefetch next element while computing current
+// 3. Shared B/C loaded cooperatively with proper coverage for all thread counts
+// 4. Vectorized float4 loads/stores for state and A tensors
+// 5. Warp-level reduction using shuffle intrinsics
 
 #include "selective_state_update.h"
 
@@ -24,16 +20,6 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
-
-// TMA support requires SM 9.0+ (Hopper/Blackwell)
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  #define VLLM_USE_TMA 1
-  #include <cuda/barrier>
-  #include <cuda/pipeline>
-using barrier = cuda::barrier<cuda::thread_scope_block>;
-#else
-  #define VLLM_USE_TMA 0
-#endif
 
 namespace vllm {
 namespace mamba {
@@ -73,13 +59,12 @@ __device__ __forceinline__ float to_float(at::BFloat16 val) {
   return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&val));
 }
 
-// V8 Kernel: Optimized with async copies and proper shared memory handling
-// Grid: (num_dim_blocks, nheads, batch_size)
-// Each block processes warps_per_block consecutive dim elements
-// All warps in block share B/C loaded into shared memory
-template <typename input_t, int DSTATE, bool HAS_D, bool HAS_Z,
-          bool DT_SOFTPLUS>
-__global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v8(
+// V9 Kernel: Software pipelining for large batch performance
+// Grid: (num_warps_total / warps_per_block, nheads, batch_size)
+// Each warp processes multiple dim elements with pipelining
+template <typename input_t, int DSTATE, int DIMS_PER_WARP, bool HAS_D,
+          bool HAS_Z, bool DT_SOFTPLUS>
+__global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v9(
     float* __restrict__ state,            // [batch, nheads, dim, dstate]
     const input_t* __restrict__ x,        // [batch, nheads, dim]
     const input_t* __restrict__ dt,       // [batch, nheads, dim]
@@ -94,21 +79,12 @@ __global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v8(
     // Strides
     int stride_state_batch, int stride_state_head, int stride_x_batch,
     int stride_x_head, int stride_B_batch, int stride_B_group) {
-  // Shared memory layout for B/C (shared across warps in block)
+  // Shared memory for B/C (shared across all warps in block)
   __shared__ __align__(16) float shared_B[DSTATE];
   __shared__ __align__(16) float shared_C[DSTATE];
 
-#if VLLM_USE_TMA
-  // Use cuda::barrier for SM 9.0+ async completion tracking
-  __shared__ barrier bar;
-  if (threadIdx.x == 0) {
-    init(&bar, blockDim.x);
-  }
-  __syncthreads();
-#endif
-
-  // Grid: (num_dim_blocks, nheads, batch_size)
-  const int dim_block_idx = blockIdx.x;
+  // Grid: (num_warp_groups, nheads, batch_size)
+  const int warp_group_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
   const int batch_idx = blockIdx.z;
   const int group_idx = head_idx / heads_per_group;
@@ -117,163 +93,268 @@ __global__ void __launch_bounds__(256, 4) selective_state_update_kernel_v8(
   const int local_warp_id = threadIdx.x / 32;
   const int lane_id = threadIdx.x % 32;
 
-  const int dim_idx = dim_block_idx * warps_per_block + local_warp_id;
+  // Global warp ID determines which dim elements this warp processes
+  const int global_warp_id = warp_group_idx * warps_per_block + local_warp_id;
+  const int dim_start = global_warp_id * DIMS_PER_WARP;
 
-  // B/C pointers for this block (shared by all warps)
+  // B/C pointers for this block
   const input_t* B_ptr =
       B + batch_idx * stride_B_batch + group_idx * stride_B_group;
   const input_t* C_ptr =
       C + batch_idx * stride_B_batch + group_idx * stride_B_group;
 
-// Load B/C into shared memory cooperatively
-// Use async copy path for SM 8.0+
-#if __CUDA_ARCH__ >= 800
-  // Async cooperative load of B/C with conversion to float
+  // Cooperative load of B/C into shared memory
   {
-    // Calculate elements per thread to ensure full coverage
-    constexpr int max_elems = (DSTATE + 31) / 32;  // Max for 32 threads
     const int elems_per_thread = (DSTATE + blockDim.x - 1) / blockDim.x;
-
-  #pragma unroll
-    for (int i = 0; i < max_elems; i++) {
-      if (i < elems_per_thread) {
-        const int idx = threadIdx.x + i * blockDim.x;
-        if (idx < DSTATE) {
-          // __ldg uses L2 cache for read-only data
-          shared_B[idx] = to_float(__ldg(&B_ptr[idx]));
-          shared_C[idx] = to_float(__ldg(&C_ptr[idx]));
-        }
+#pragma unroll
+    for (int i = 0; i < elems_per_thread; i++) {
+      const int idx = threadIdx.x + i * blockDim.x;
+      if (idx < DSTATE) {
+        shared_B[idx] = to_float(__ldg(&B_ptr[idx]));
+        shared_C[idx] = to_float(__ldg(&C_ptr[idx]));
       }
     }
   }
-#else
-  // Standard cooperative load for older architectures
-  for (int i = threadIdx.x; i < DSTATE; i += blockDim.x) {
-    shared_B[i] = to_float(B_ptr[i]);
-    shared_C[i] = to_float(C_ptr[i]);
-  }
-#endif
 
-#if VLLM_USE_TMA
-  // Use barrier instead of __syncthreads for SM 9.0+
-  bar.arrive_and_wait();
-#else
-  // Synchronize to ensure B/C are loaded before computation
   __syncthreads();
-#endif
 
-  // Early exit for out-of-bounds warps (AFTER sync to avoid deadlock)
+  // Early exit if this warp has no work
+  if (dim_start >= dim) return;
+
+  // Process multiple dim elements sequentially with pipelining
+#if __CUDA_ARCH__ >= 800 && DIMS_PER_WARP > 1
+  // Pipelined version: prefetch next while computing current
+
+  // Stage 0: Load first element
+  int dim_idx = dim_start;
   if (dim_idx >= dim) return;
 
-  // Input offset for this (batch, head, dim)
-  const int x_offset =
+  int x_offset =
       batch_idx * stride_x_batch + head_idx * stride_x_head + dim_idx;
+  int state_base = batch_idx * stride_state_batch +
+                   head_idx * stride_state_head + dim_idx * DSTATE;
+  int A_base = head_idx * dim * DSTATE + dim_idx * DSTATE;
 
-  // State and A base offsets
-  const int state_base = batch_idx * stride_state_batch +
-                         head_idx * stride_state_head + dim_idx * DSTATE;
-  const int A_base = head_idx * dim * DSTATE + dim_idx * DSTATE;
+  // Load current state/A
+  const float4* state_vec = reinterpret_cast<const float4*>(state + state_base);
+  const float4* A_vec = reinterpret_cast<const float4*>(A + A_base);
+  float4 state_f4 = __ldg(&state_vec[lane_id]);
+  float4 A_f4 = __ldg(&A_vec[lane_id]);
 
-  // Load scalar inputs using __ldg for read-only data
+  // Prefetch scalars
   float x_val = to_float(__ldg(&x[x_offset]));
   float dt_val = to_float(__ldg(&dt[x_offset]));
-
-  // Add dt_bias if present
   if (dt_bias != nullptr) {
     dt_val += to_float(__ldg(&dt_bias[head_idx * dim + dim_idx]));
   }
-
-  // Apply softplus to dt
   if constexpr (DT_SOFTPLUS) {
     dt_val = softplus(dt_val);
   }
 
-  // Load z if present
-  float z_val = 0.0f;
-  if constexpr (HAS_Z) {
-    z_val = to_float(__ldg(&z[x_offset]));
-  }
+  float z_val = 0.0f, d_val = 0.0f;
+  if constexpr (HAS_Z) z_val = to_float(__ldg(&z[x_offset]));
+  if constexpr (HAS_D) d_val = to_float(__ldg(&D[head_idx * dim + dim_idx]));
 
-  // Load D if present
-  float d_val = 0.0f;
-  if constexpr (HAS_D) {
-    d_val = to_float(__ldg(&D[head_idx * dim + dim_idx]));
-  }
+  #pragma unroll
+  for (int d = 0; d < DIMS_PER_WARP; d++) {
+    dim_idx = dim_start + d;
+    if (dim_idx >= dim) break;
 
-  // Each lane processes DSTATE/32 = 4 elements (for DSTATE=128)
-  float out_acc = 0.0f;
+    // Prefetch next element's data (if not last)
+    float4 next_state_f4, next_A_f4;
+    float next_x_val = 0, next_dt_val = 0, next_z_val = 0, next_d_val = 0;
 
-  // Load state and A using float4 vectorized loads via __ldg
-  const float4* state_vec = reinterpret_cast<const float4*>(state + state_base);
-  const float4* A_vec = reinterpret_cast<const float4*>(A + A_base);
-  float4* state_out_vec = reinterpret_cast<float4*>(state + state_base);
+    if (d + 1 < DIMS_PER_WARP && dim_start + d + 1 < dim) {
+      int next_dim_idx = dim_start + d + 1;
+      int next_x_offset =
+          batch_idx * stride_x_batch + head_idx * stride_x_head + next_dim_idx;
+      int next_state_base = batch_idx * stride_state_batch +
+                            head_idx * stride_state_head +
+                            next_dim_idx * DSTATE;
+      int next_A_base = head_idx * dim * DSTATE + next_dim_idx * DSTATE;
 
-  // Each lane handles one float4 (4 consecutive dstate elements)
-  float4 state_f4 = __ldg(&state_vec[lane_id]);
-  float4 A_f4 = __ldg(&A_vec[lane_id]);
+      const float4* next_state_vec =
+          reinterpret_cast<const float4*>(state + next_state_base);
+      const float4* next_A_vec =
+          reinterpret_cast<const float4*>(A + next_A_base);
 
-  // Read B and C from shared memory (already converted to float)
-  float B_vals[4], C_vals[4];
-#pragma unroll
-  for (int i = 0; i < 4; i++) {
-    int n = lane_id * 4 + i;
-    B_vals[i] = shared_B[n];
-    C_vals[i] = shared_C[n];
-  }
+      next_state_f4 = __ldg(&next_state_vec[lane_id]);
+      next_A_f4 = __ldg(&next_A_vec[lane_id]);
 
-  // Process 4 elements per lane
-  float state_vals[4] = {state_f4.x, state_f4.y, state_f4.z, state_f4.w};
-  float A_vals[4] = {A_f4.x, A_f4.y, A_f4.z, A_f4.w};
-
-#pragma unroll
-  for (int i = 0; i < 4; i++) {
-    // dA = exp(A * dt)
-    float dA = expf(A_vals[i] * dt_val);
-
-    // dB = B * dt
-    float dB = B_vals[i] * dt_val;
-
-    // Update state: state = state * dA + dB * x
-    state_vals[i] = state_vals[i] * dA + dB * x_val;
-
-    // Accumulate output: out += state * C
-    out_acc += state_vals[i] * C_vals[i];
-  }
-
-  // Store updated state using float4
-  float4 state_out =
-      make_float4(state_vals[0], state_vals[1], state_vals[2], state_vals[3]);
-  state_out_vec[lane_id] = state_out;
-
-  // Warp-level reduction to sum out_acc across all lanes
-  out_acc = warp_reduce_sum(out_acc);
-
-  // Lane 0 writes the final output
-  if (lane_id == 0) {
-    // Add skip connection
-    if constexpr (HAS_D) {
-      out_acc += x_val * d_val;
+      next_x_val = to_float(__ldg(&x[next_x_offset]));
+      next_dt_val = to_float(__ldg(&dt[next_x_offset]));
+      if (dt_bias != nullptr) {
+        next_dt_val += to_float(__ldg(&dt_bias[head_idx * dim + next_dim_idx]));
+      }
+      if constexpr (DT_SOFTPLUS) {
+        next_dt_val = softplus(next_dt_val);
+      }
+      if constexpr (HAS_Z) next_z_val = to_float(__ldg(&z[next_x_offset]));
+      if constexpr (HAS_D)
+        next_d_val = to_float(__ldg(&D[head_idx * dim + next_dim_idx]));
     }
 
-    // Apply gating
-    if constexpr (HAS_Z) {
-      out_acc *= z_val * fast_sigmoid(z_val);
+    // Compute current element
+    float B_vals[4], C_vals[4];
+  #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      int n = lane_id * 4 + i;
+      B_vals[i] = shared_B[n];
+      C_vals[i] = shared_C[n];
     }
 
-    // Store output
-    out[x_offset] = static_cast<input_t>(out_acc);
+    float state_vals[4] = {state_f4.x, state_f4.y, state_f4.z, state_f4.w};
+    float A_vals[4] = {A_f4.x, A_f4.y, A_f4.z, A_f4.w};
+
+    float out_acc = 0.0f;
+  #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float dA = expf(A_vals[i] * dt_val);
+      float dB = B_vals[i] * dt_val;
+      state_vals[i] = state_vals[i] * dA + dB * x_val;
+      out_acc += state_vals[i] * C_vals[i];
+    }
+
+    // Store updated state
+    x_offset = batch_idx * stride_x_batch + head_idx * stride_x_head + dim_idx;
+    state_base = batch_idx * stride_state_batch + head_idx * stride_state_head +
+                 dim_idx * DSTATE;
+    float4* state_out_vec = reinterpret_cast<float4*>(state + state_base);
+    float4 state_out =
+        make_float4(state_vals[0], state_vals[1], state_vals[2], state_vals[3]);
+    state_out_vec[lane_id] = state_out;
+
+    // Warp reduction and output
+    out_acc = warp_reduce_sum(out_acc);
+    if (lane_id == 0) {
+      if constexpr (HAS_D) out_acc += x_val * d_val;
+      if constexpr (HAS_Z) out_acc *= z_val * fast_sigmoid(z_val);
+      out[x_offset] = static_cast<input_t>(out_acc);
+    }
+
+    // Move prefetched to current for next iteration
+    state_f4 = next_state_f4;
+    A_f4 = next_A_f4;
+    x_val = next_x_val;
+    dt_val = next_dt_val;
+    z_val = next_z_val;
+    d_val = next_d_val;
   }
+
+#else
+  // Non-pipelined version for SM < 8.0 or DIMS_PER_WARP == 1
+  #pragma unroll
+  for (int d = 0; d < DIMS_PER_WARP; d++) {
+    const int dim_idx = dim_start + d;
+    if (dim_idx >= dim) break;
+
+    const int x_offset =
+        batch_idx * stride_x_batch + head_idx * stride_x_head + dim_idx;
+    const int state_base = batch_idx * stride_state_batch +
+                           head_idx * stride_state_head + dim_idx * DSTATE;
+    const int A_base = head_idx * dim * DSTATE + dim_idx * DSTATE;
+
+    float x_val = to_float(__ldg(&x[x_offset]));
+    float dt_val = to_float(__ldg(&dt[x_offset]));
+    if (dt_bias != nullptr) {
+      dt_val += to_float(__ldg(&dt_bias[head_idx * dim + dim_idx]));
+    }
+    if constexpr (DT_SOFTPLUS) {
+      dt_val = softplus(dt_val);
+    }
+
+    float z_val = 0.0f, d_val = 0.0f;
+    if constexpr (HAS_Z) z_val = to_float(__ldg(&z[x_offset]));
+    if constexpr (HAS_D) d_val = to_float(__ldg(&D[head_idx * dim + dim_idx]));
+
+    const float4* state_vec =
+        reinterpret_cast<const float4*>(state + state_base);
+    const float4* A_vec = reinterpret_cast<const float4*>(A + A_base);
+    float4* state_out_vec = reinterpret_cast<float4*>(state + state_base);
+
+    float4 state_f4 = __ldg(&state_vec[lane_id]);
+    float4 A_f4 = __ldg(&A_vec[lane_id]);
+
+    float B_vals[4], C_vals[4];
+  #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      int n = lane_id * 4 + i;
+      B_vals[i] = shared_B[n];
+      C_vals[i] = shared_C[n];
+    }
+
+    float state_vals[4] = {state_f4.x, state_f4.y, state_f4.z, state_f4.w};
+    float A_vals[4] = {A_f4.x, A_f4.y, A_f4.z, A_f4.w};
+
+    float out_acc = 0.0f;
+  #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float dA = expf(A_vals[i] * dt_val);
+      float dB = B_vals[i] * dt_val;
+      state_vals[i] = state_vals[i] * dA + dB * x_val;
+      out_acc += state_vals[i] * C_vals[i];
+    }
+
+    float4 state_out =
+        make_float4(state_vals[0], state_vals[1], state_vals[2], state_vals[3]);
+    state_out_vec[lane_id] = state_out;
+
+    out_acc = warp_reduce_sum(out_acc);
+    if (lane_id == 0) {
+      if constexpr (HAS_D) out_acc += x_val * d_val;
+      if constexpr (HAS_Z) out_acc *= z_val * fast_sigmoid(z_val);
+      out[x_offset] = static_cast<input_t>(out_acc);
+    }
+  }
+#endif
 }
 
-// Macro for kernel launch (v8 uses 3D grid)
-#define LAUNCH_KERNEL_V8(HAS_D_VAL, HAS_Z_VAL, DT_SOFTPLUS_VAL)         \
-  selective_state_update_kernel_v8<scalar_t, 128, HAS_D_VAL, HAS_Z_VAL, \
-                                   DT_SOFTPLUS_VAL>                     \
-      <<<grid, block, 0, stream>>>(                                     \
-          state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,  \
-          dt_bias_ptr, out_ptr, dim, nheads, ngroups, heads_per_group,  \
-          stride_state_batch, stride_state_head, stride_x_batch,        \
+// Launch helper with DIMS_PER_WARP template
+template <typename scalar_t, int DIMS_PER_WARP>
+void launch_kernel_with_dims_per_warp(
+    float* state_ptr, const scalar_t* x_ptr, const scalar_t* dt_ptr,
+    const float* A_ptr, const scalar_t* B_ptr, const scalar_t* C_ptr,
+    const scalar_t* D_ptr, const scalar_t* z_ptr, const scalar_t* dt_bias_ptr,
+    scalar_t* out_ptr, bool has_D, bool has_z, bool dt_softplus, int batch_size,
+    int nheads, int dim, int ngroups, int heads_per_group,
+    int stride_state_batch, int stride_state_head, int stride_x_batch,
+    int stride_x_head, int stride_B_batch, int stride_B_group,
+    int threads_per_block, cudaStream_t stream) {
+  const int warps_per_block = threads_per_block / 32;
+  const int dims_per_block = warps_per_block * DIMS_PER_WARP;
+  const int num_warp_groups = (dim + dims_per_block - 1) / dims_per_block;
+
+  dim3 grid(num_warp_groups, nheads, batch_size);
+  dim3 block(threads_per_block);
+
+#define LAUNCH_V9(HAS_D_VAL, HAS_Z_VAL, DT_SOFTPLUS_VAL)                    \
+  selective_state_update_kernel_v9<scalar_t, 128, DIMS_PER_WARP, HAS_D_VAL, \
+                                   HAS_Z_VAL, DT_SOFTPLUS_VAL>              \
+      <<<grid, block, 0, stream>>>(                                         \
+          state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,      \
+          dt_bias_ptr, out_ptr, dim, nheads, ngroups, heads_per_group,      \
+          stride_state_batch, stride_state_head, stride_x_batch,            \
           stride_x_head, stride_B_batch, stride_B_group)
+
+  if (has_D && has_z && dt_softplus) {
+    LAUNCH_V9(true, true, true);
+  } else if (has_D && has_z && !dt_softplus) {
+    LAUNCH_V9(true, true, false);
+  } else if (has_D && !has_z && dt_softplus) {
+    LAUNCH_V9(true, false, true);
+  } else if (has_D && !has_z && !dt_softplus) {
+    LAUNCH_V9(true, false, false);
+  } else if (!has_D && has_z && dt_softplus) {
+    LAUNCH_V9(false, true, true);
+  } else if (!has_D && has_z && !dt_softplus) {
+    LAUNCH_V9(false, true, false);
+  } else if (!has_D && !has_z && dt_softplus) {
+    LAUNCH_V9(false, false, true);
+  } else {
+    LAUNCH_V9(false, false, false);
+  }
+#undef LAUNCH_V9
+}
 
 // Helper template function for kernel dispatch
 template <typename scalar_t>
@@ -286,8 +367,8 @@ void launch_selective_state_update_kernel(
     bool has_z, bool dt_softplus, int batch_size, int nheads, int dim,
     int ngroups, int heads_per_group, int stride_state_batch,
     int stride_state_head, int stride_x_batch, int stride_x_head,
-    int stride_B_batch, int stride_B_group, dim3 grid, dim3 block,
-    cudaStream_t stream) {
+    int stride_B_batch, int stride_B_group, int threads_per_block,
+    int dims_per_warp, cudaStream_t stream) {
   const scalar_t* x_ptr = x.data_ptr<scalar_t>();
   const scalar_t* dt_ptr = dt.data_ptr<scalar_t>();
   const scalar_t* B_ptr = B.data_ptr<scalar_t>();
@@ -298,27 +379,51 @@ void launch_selective_state_update_kernel(
       dt_bias.has_value() ? dt_bias.value().data_ptr<scalar_t>() : nullptr;
   scalar_t* out_ptr = out.data_ptr<scalar_t>();
 
-  // Dispatch on boolean flags (8 combinations)
-  if (has_D && has_z && dt_softplus) {
-    LAUNCH_KERNEL_V8(true, true, true);
-  } else if (has_D && has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V8(true, true, false);
-  } else if (has_D && !has_z && dt_softplus) {
-    LAUNCH_KERNEL_V8(true, false, true);
-  } else if (has_D && !has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V8(true, false, false);
-  } else if (!has_D && has_z && dt_softplus) {
-    LAUNCH_KERNEL_V8(false, true, true);
-  } else if (!has_D && has_z && !dt_softplus) {
-    LAUNCH_KERNEL_V8(false, true, false);
-  } else if (!has_D && !has_z && dt_softplus) {
-    LAUNCH_KERNEL_V8(false, false, true);
-  } else {
-    LAUNCH_KERNEL_V8(false, false, false);
+  // Dispatch based on dims_per_warp (must be compile-time for pipelining)
+  switch (dims_per_warp) {
+    case 1:
+      launch_kernel_with_dims_per_warp<scalar_t, 1>(
+          state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,
+          dt_bias_ptr, out_ptr, has_D, has_z, dt_softplus, batch_size, nheads,
+          dim, ngroups, heads_per_group, stride_state_batch, stride_state_head,
+          stride_x_batch, stride_x_head, stride_B_batch, stride_B_group,
+          threads_per_block, stream);
+      break;
+    case 2:
+      launch_kernel_with_dims_per_warp<scalar_t, 2>(
+          state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,
+          dt_bias_ptr, out_ptr, has_D, has_z, dt_softplus, batch_size, nheads,
+          dim, ngroups, heads_per_group, stride_state_batch, stride_state_head,
+          stride_x_batch, stride_x_head, stride_B_batch, stride_B_group,
+          threads_per_block, stream);
+      break;
+    case 4:
+      launch_kernel_with_dims_per_warp<scalar_t, 4>(
+          state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,
+          dt_bias_ptr, out_ptr, has_D, has_z, dt_softplus, batch_size, nheads,
+          dim, ngroups, heads_per_group, stride_state_batch, stride_state_head,
+          stride_x_batch, stride_x_head, stride_B_batch, stride_B_group,
+          threads_per_block, stream);
+      break;
+    case 8:
+      launch_kernel_with_dims_per_warp<scalar_t, 8>(
+          state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,
+          dt_bias_ptr, out_ptr, has_D, has_z, dt_softplus, batch_size, nheads,
+          dim, ngroups, heads_per_group, stride_state_batch, stride_state_head,
+          stride_x_batch, stride_x_head, stride_B_batch, stride_B_group,
+          threads_per_block, stream);
+      break;
+    default:
+      // Fallback to dims_per_warp=1
+      launch_kernel_with_dims_per_warp<scalar_t, 1>(
+          state_ptr, x_ptr, dt_ptr, A_ptr, B_ptr, C_ptr, D_ptr, z_ptr,
+          dt_bias_ptr, out_ptr, has_D, has_z, dt_softplus, batch_size, nheads,
+          dim, ngroups, heads_per_group, stride_state_batch, stride_state_head,
+          stride_x_batch, stride_x_head, stride_B_batch, stride_B_group,
+          threads_per_block, stream);
+      break;
   }
 }
-
-#undef LAUNCH_KERNEL_V8
 
 // Launcher function with configurable parameters
 void selective_state_update_cuda(
@@ -354,14 +459,20 @@ void selective_state_update_cuda(
   const int stride_B_batch = B.stride(0);
   const int stride_B_group = B.stride(1);
 
-  // V8: Use 3D grid (num_dim_blocks, nheads, batch_size)
-  // This ensures all warps in a block share the same (batch, group) for B/C
-  const int warps_per_block = threads_per_block / 32;
-  const int threads = warps_per_block * 32;
-  const int num_dim_blocks = (dim + warps_per_block - 1) / warps_per_block;
-
-  dim3 grid(num_dim_blocks, nheads, batch_size);
-  dim3 block(threads);
+  // Use block_size_m as dims_per_warp (how many dim elements each warp
+  // processes) Valid values: 1, 2, 4, 8
+  int dims_per_warp = static_cast<int>(block_size_m);
+  if (dims_per_warp < 1) dims_per_warp = 1;
+  if (dims_per_warp > 8) dims_per_warp = 8;
+  // Round to nearest power of 2
+  if (dims_per_warp >= 6)
+    dims_per_warp = 8;
+  else if (dims_per_warp >= 3)
+    dims_per_warp = 4;
+  else if (dims_per_warp >= 2)
+    dims_per_warp = 2;
+  else
+    dims_per_warp = 1;
 
   // Get CUDA stream
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -380,19 +491,22 @@ void selective_state_update_cuda(
         state_ptr, A_ptr, x, dt, B, C, D, z, dt_bias, out, has_D, has_z,
         dt_softplus, batch_size, nheads, dim, ngroups, heads_per_group,
         stride_state_batch, stride_state_head, stride_x_batch, stride_x_head,
-        stride_B_batch, stride_B_group, grid, block, stream);
+        stride_B_batch, stride_B_group, static_cast<int>(threads_per_block),
+        dims_per_warp, stream);
   } else if (x.scalar_type() == at::ScalarType::BFloat16) {
     launch_selective_state_update_kernel<at::BFloat16>(
         state_ptr, A_ptr, x, dt, B, C, D, z, dt_bias, out, has_D, has_z,
         dt_softplus, batch_size, nheads, dim, ngroups, heads_per_group,
         stride_state_batch, stride_state_head, stride_x_batch, stride_x_head,
-        stride_B_batch, stride_B_group, grid, block, stream);
+        stride_B_batch, stride_B_group, static_cast<int>(threads_per_block),
+        dims_per_warp, stream);
   } else if (x.scalar_type() == at::ScalarType::Float) {
     launch_selective_state_update_kernel<float>(
         state_ptr, A_ptr, x, dt, B, C, D, z, dt_bias, out, has_D, has_z,
         dt_softplus, batch_size, nheads, dim, ngroups, heads_per_group,
         stride_state_batch, stride_state_head, stride_x_batch, stride_x_head,
-        stride_B_batch, stride_B_group, grid, block, stream);
+        stride_B_batch, stride_B_group, static_cast<int>(threads_per_block),
+        dims_per_warp, stream);
   } else {
     TORCH_CHECK(false, "Unsupported input dtype: ", x.scalar_type());
   }

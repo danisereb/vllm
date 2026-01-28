@@ -359,20 +359,23 @@ def run_config_sweep(
         triton_time = None
     print()
 
-    # Configuration grid
-    # Note: v4 kernel limited to 256 threads by __launch_bounds__(256, 4)
-    block_sizes = [8, 16, 32, 64, 128]
+    # Configuration grid for V9 kernel
+    # - dims_per_warp: how many dim elements each warp processes (1, 2, 4, 8)
+    # - threads: limited to 256 by __launch_bounds__(256, 4)
+    # block_size_m now controls dims_per_warp for pipelining
+    dims_per_warp_values = [1, 2, 4, 8]
     thread_counts = [32, 64, 128, 256]
 
     print(
-        f"{'block_size_m':>12} | {'threads':>8} | {'CUDA (ms)':>10} | {'vs Triton':>10}"
+        f"{'dims_per_warp':>13} | {'threads':>8} | "
+        f"{'CUDA (ms)':>10} | {'vs Triton':>10}"
     )
     print("-" * 50)
 
     best_time = float("inf")
     best_config = None
 
-    for block_size_m in block_sizes:
+    for dims_per_warp in dims_per_warp_values:
         for threads in thread_counts:
             try:
                 cuda_time = benchmark_cuda_kernel(
@@ -381,7 +384,7 @@ def run_config_sweep(
                     dim,
                     dstate,
                     ngroups,
-                    block_size_m,
+                    dims_per_warp,  # Now controls dims_per_warp for pipelining
                     threads,
                     state_dtype,
                 )
@@ -393,21 +396,21 @@ def run_config_sweep(
 
                 marker = " *" if cuda_time < best_time else ""
                 print(
-                    f"{block_size_m:>12} | {threads:>8} | {cuda_time:>10.3f} | "
+                    f"{dims_per_warp:>13} | {threads:>8} | {cuda_time:>10.3f} | "
                     f"{speedup_str}{marker}"
                 )
 
                 if cuda_time < best_time:
                     best_time = cuda_time
-                    best_config = (block_size_m, threads)
+                    best_config = (dims_per_warp, threads)
 
             except Exception as e:
-                print(f"{block_size_m:>12} | {threads:>8} | ERROR: {e}")
+                print(f"{dims_per_warp:>13} | {threads:>8} | ERROR: {e}")
 
     print()
     if best_config:
         print(
-            f"Best config: block_size_m={best_config[0]}, "
+            f"Best config: dims_per_warp={best_config[0]}, "
             f"threads_per_block={best_config[1]}"
         )
         print(f"Best time: {best_time:.3f} ms")
@@ -433,8 +436,8 @@ def main():
     parser.add_argument(
         "--block-size-m",
         type=int,
-        default=32,
-        help="Dim elements per block (default: 32)",
+        default=1,
+        help="Dims per warp for pipelining: 1, 2, 4, or 8 (default: 1)",
     )
     parser.add_argument(
         "--threads", type=int, default=128, help="Threads per block (default: 128)"
