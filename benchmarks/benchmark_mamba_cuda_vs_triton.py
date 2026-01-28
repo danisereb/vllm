@@ -342,8 +342,9 @@ def run_config_sweep(batch_size, nheads, dim, dstate, ngroups):
     print()
 
     # Configuration grid
+    # Note: threads_per_block limited to 256 by kernel's __launch_bounds__
     block_sizes = [8, 16, 32, 64, 128]
-    thread_counts = [32, 64, 128, 256, 512]
+    thread_counts = [32, 64, 128, 256]
 
     print(
         f"{'block_size_m':>12} | {'threads':>8} | {'CUDA (ms)':>10} | {'vs Triton':>10}"

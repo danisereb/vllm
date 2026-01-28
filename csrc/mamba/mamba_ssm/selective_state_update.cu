@@ -272,6 +272,12 @@ void selective_state_update_cuda(
   // Validate dimensions
   TORCH_CHECK(nheads % ngroups == 0, "nheads must be divisible by ngroups");
   TORCH_CHECK(dstate == 128, "This kernel requires dstate=128, got ", dstate);
+  TORCH_CHECK(threads_per_block >= 32 && threads_per_block <= 256,
+              "threads_per_block must be between 32 and 256, got ",
+              threads_per_block);
+  TORCH_CHECK(threads_per_block % 32 == 0,
+              "threads_per_block must be a multiple of 32, got ",
+              threads_per_block);
 
   // Get strides
   const int stride_state_batch = state.stride(0);
