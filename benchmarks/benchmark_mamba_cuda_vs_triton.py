@@ -251,19 +251,21 @@ def main():
     print("-" * 50)
 
     for batch_size in batch_sizes:
+        triton_time = None
+        cuda_time = None
+
         try:
             triton_time = benchmark_triton_kernel(
                 batch_size, nheads, dim, dstate, ngroups
             )
-        except Exception:
-            print(f"{batch_size:>8} | {'ERROR':>12} | ", end="")
-            triton_time = None
+        except Exception as e:
+            print(f"{batch_size:>8} | Triton ERROR: {e}")
+            continue
 
         try:
             cuda_time = benchmark_cuda_kernel(batch_size, nheads, dim, dstate, ngroups)
-        except Exception:
-            print(f"{'ERROR':>12} | {'N/A':>10}")
-            cuda_time = None
+        except Exception as e:
+            print(f"{batch_size:>8} | {triton_time:>12.3f} | CUDA ERROR: {e}")
             continue
 
         if triton_time and cuda_time:
@@ -273,7 +275,7 @@ def main():
                 f" | {cuda_time:>12.3f} | {speedup:>9.2f}x"
             )
         elif cuda_time:
-            print(f"{cuda_time:>12.3f} | {'N/A':>10}")
+            print(f"{batch_size:>8} | {'N/A':>12} | {cuda_time:>12.3f} | {'N/A':>10}")
 
     print()
     print("Note: Speedup > 1.0 means CUDA kernel is faster than Triton.")
