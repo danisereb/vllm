@@ -47,12 +47,12 @@ __device__ __forceinline__ float to_float(T val) {
 
 template <>
 __device__ __forceinline__ float to_float(at::Half val) {
-  return __half2float(val);
+  return __half2float(*reinterpret_cast<const __half*>(&val));
 }
 
 template <>
 __device__ __forceinline__ float to_float(at::BFloat16 val) {
-  return __bfloat162float(val);
+  return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&val));
 }
 
 // Main kernel: Each warp processes one (batch, head, dim) element
