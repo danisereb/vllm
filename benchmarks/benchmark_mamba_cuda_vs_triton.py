@@ -360,9 +360,9 @@ def run_config_sweep(
     print()
 
     # Configuration grid
-    # Note: threads_per_block limited to 256 by kernel's __launch_bounds__
+    # Note: v6 kernel allows up to 1024 threads (no shared memory sync)
     block_sizes = [8, 16, 32, 64, 128]
-    thread_counts = [32, 64, 128, 256]
+    thread_counts = [64, 128, 256, 512, 1024]
 
     print(
         f"{'block_size_m':>12} | {'threads':>8} | {'CUDA (ms)':>10} | {'vs Triton':>10}"
