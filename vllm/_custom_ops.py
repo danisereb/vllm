@@ -2032,6 +2032,28 @@ def selective_scan_fwd(
     )
 
 
+def selective_state_update_cuda(
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor | None,
+    z: torch.Tensor | None,
+    dt_bias: torch.Tensor | None,
+    out: torch.Tensor,
+    dt_softplus: bool,
+) -> None:
+    """
+    Optimized SSM decode kernel for Blackwell (B200) GPUs.
+    Specialized for dim=64, dstate=128, nheads/ngroups=8 (Nemotron-H config).
+    """
+    torch.ops._C.selective_state_update_cuda(
+        state, x, dt, A, B, C, D, z, dt_bias, out, dt_softplus
+    )
+
+
 # NOTE: The wvSplitK kernel (and all of the kernels in skinny_gemms.cu)
 # are unable to properly handle non-contiguous
 # tensors.  It might be a good TODO(rasmith) to augment these kernels
