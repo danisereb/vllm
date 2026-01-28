@@ -641,12 +641,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? initial_state_idx) -> ()");
   ops.impl("selective_scan_fwd", torch::kCUDA, &selective_scan_fwd);
 
-  // Optimized SSM decode kernel for Blackwell (B200)
+  // Optimized SSM decode kernel for Blackwell (B200) - configurable
   ops.def(
       "selective_state_update_cuda(Tensor! state, Tensor x, Tensor dt,"
       "Tensor A, Tensor B, Tensor C,"
       "Tensor? D, Tensor? z, Tensor? dt_bias,"
-      "Tensor! out, bool dt_softplus) -> ()");
+      "Tensor! out, bool dt_softplus,"
+      "int block_size_m, int threads_per_block) -> ()");
   ops.impl("selective_state_update_cuda", torch::kCUDA,
            &vllm::mamba::selective_state_update_cuda);
 

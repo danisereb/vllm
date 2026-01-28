@@ -9,7 +9,12 @@ Usage:
 
     # Then run the benchmark:
     python benchmarks/benchmark_mamba_cuda_vs_triton.py
+
+    # Sweep configurations:
+    python benchmarks/benchmark_mamba_cuda_vs_triton.py --sweep
 """
+
+import argparse
 
 import torch
 
@@ -190,9 +195,11 @@ def benchmark_cuda_kernel(
     dim: int,
     dstate: int,
     ngroups: int,
+    block_size_m: int = 32,
+    threads_per_block: int = 128,
     num_iterations: int = 100,
 ) -> float:
-    """Benchmark the CUDA kernel."""
+    """Benchmark the CUDA kernel with configurable parameters."""
     from vllm import _custom_ops as ops
 
     device = torch.device("cuda:0")
@@ -213,7 +220,21 @@ def benchmark_cuda_kernel(
 
     # Warmup
     for _ in range(10):
-        ops.selective_state_update_cuda(state, x, dt, A, B, C, D, z, dt_bias, out, True)
+        ops.selective_state_update_cuda(
+            state,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            z,
+            dt_bias,
+            out,
+            True,
+            block_size_m,
+            threads_per_block,
+        )
     torch.cuda.synchronize()
 
     # Benchmark
@@ -222,33 +243,44 @@ def benchmark_cuda_kernel(
 
     start.record()
     for _ in range(num_iterations):
-        ops.selective_state_update_cuda(state, x, dt, A, B, C, D, z, dt_bias, out, True)
+        ops.selective_state_update_cuda(
+            state,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            z,
+            dt_bias,
+            out,
+            True,
+            block_size_m,
+            threads_per_block,
+        )
     end.record()
     torch.cuda.synchronize()
 
     return start.elapsed_time(end) / num_iterations
 
 
-def main():
-    # Configuration matching Nemotron-H
-    nheads = 64
-    dim = 64
-    dstate = 128
-    ngroups = 8
-
-    batch_sizes = [32, 64, 128, 256, 512, 1024]
-
+def run_comparison(
+    batch_sizes, nheads, dim, dstate, ngroups, block_size_m=32, threads_per_block=128
+):
+    """Run comparison between Triton and CUDA kernels."""
     print("=" * 70)
     print("Mamba Decode Kernel Benchmark: Triton vs CUDA")
     print("=" * 70)
+    print(f"Config: nheads={nheads}, dim={dim}, dstate={dstate}, ngroups={ngroups}")
     print(
-        f"Configuration: nheads={nheads}, dim={dim}, dstate={dstate}, ngroups={ngroups}"
+        f"CUDA params: block_size_m={block_size_m}, "
+        f"threads_per_block={threads_per_block}"
     )
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print()
 
     print(f"{'Batch':>8} | {'Triton (ms)':>12} | {'CUDA (ms)':>12} | {'Speedup':>10}")
-    print("-" * 50)
+    print("-" * 55)
 
     for batch_size in batch_sizes:
         triton_time = None
@@ -263,7 +295,15 @@ def main():
             continue
 
         try:
-            cuda_time = benchmark_cuda_kernel(batch_size, nheads, dim, dstate, ngroups)
+            cuda_time = benchmark_cuda_kernel(
+                batch_size,
+                nheads,
+                dim,
+                dstate,
+                ngroups,
+                block_size_m,
+                threads_per_block,
+            )
         except Exception as e:
             print(f"{batch_size:>8} | {triton_time:>12.3f} | CUDA ERROR: {e}")
             continue
@@ -278,6 +318,117 @@ def main():
             print(f"{batch_size:>8} | {'N/A':>12} | {cuda_time:>12.3f} | {'N/A':>10}")
 
     print()
+
+
+def run_config_sweep(batch_size, nheads, dim, dstate, ngroups):
+    """Sweep different CUDA kernel configurations."""
+    print("=" * 70)
+    print("CUDA Kernel Configuration Sweep")
+    print("=" * 70)
+    print(
+        f"Config: batch={batch_size}, nheads={nheads}, dim={dim}, "
+        f"dstate={dstate}, ngroups={ngroups}"
+    )
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print()
+
+    # Get Triton baseline
+    try:
+        triton_time = benchmark_triton_kernel(batch_size, nheads, dim, dstate, ngroups)
+        print(f"Triton baseline: {triton_time:.3f} ms")
+    except Exception as e:
+        print(f"Triton ERROR: {e}")
+        triton_time = None
+    print()
+
+    # Configuration grid
+    block_sizes = [8, 16, 32, 64, 128]
+    thread_counts = [32, 64, 128, 256, 512]
+
+    print(
+        f"{'block_size_m':>12} | {'threads':>8} | {'CUDA (ms)':>10} | {'vs Triton':>10}"
+    )
+    print("-" * 50)
+
+    best_time = float("inf")
+    best_config = None
+
+    for block_size_m in block_sizes:
+        for threads in thread_counts:
+            try:
+                cuda_time = benchmark_cuda_kernel(
+                    batch_size, nheads, dim, dstate, ngroups, block_size_m, threads
+                )
+                if triton_time:
+                    speedup = triton_time / cuda_time
+                    speedup_str = f"{speedup:>9.2f}x"
+                else:
+                    speedup_str = "N/A"
+
+                marker = " *" if cuda_time < best_time else ""
+                print(
+                    f"{block_size_m:>12} | {threads:>8} | {cuda_time:>10.3f} | "
+                    f"{speedup_str}{marker}"
+                )
+
+                if cuda_time < best_time:
+                    best_time = cuda_time
+                    best_config = (block_size_m, threads)
+
+            except Exception as e:
+                print(f"{block_size_m:>12} | {threads:>8} | ERROR: {e}")
+
+    print()
+    if best_config:
+        print(
+            f"Best config: block_size_m={best_config[0]}, "
+            f"threads_per_block={best_config[1]}"
+        )
+        print(f"Best time: {best_time:.3f} ms")
+        if triton_time:
+            print(f"Best vs Triton: {triton_time / best_time:.2f}x")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Benchmark Mamba CUDA vs Triton kernels"
+    )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Sweep different CUDA kernel configurations",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=512,
+        help="Batch size for sweep mode (default: 512)",
+    )
+    parser.add_argument(
+        "--block-size-m",
+        type=int,
+        default=32,
+        help="Dim elements per block (default: 32)",
+    )
+    parser.add_argument(
+        "--threads", type=int, default=128, help="Threads per block (default: 128)"
+    )
+    args = parser.parse_args()
+
+    # Configuration matching Nemotron-H
+    nheads = 64
+    dim = 64
+    dstate = 128
+    ngroups = 8
+
+    if args.sweep:
+        run_config_sweep(args.batch_size, nheads, dim, dstate, ngroups)
+    else:
+        batch_sizes = [32, 64, 128, 256, 512, 1024]
+        run_comparison(
+            batch_sizes, nheads, dim, dstate, ngroups, args.block_size_m, args.threads
+        )
+
     print("Note: Speedup > 1.0 means CUDA kernel is faster than Triton.")
 
 

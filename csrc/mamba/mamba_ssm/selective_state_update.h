@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// Optimized Mamba SSM decode kernel for Blackwell (B200) and newer GPUs.
-// Uses TMA-style memory access patterns for better bandwidth utilization.
+// Configurable Mamba SSM decode kernel for Blackwell (B200) and newer GPUs.
+// Runtime configurable: block_size_m, threads_per_block
 
 #pragma once
 
@@ -11,8 +11,8 @@
 namespace vllm {
 namespace mamba {
 
-// Optimized selective state update for decode phase.
-// Processes state updates with improved memory access patterns for B200.
+// Configurable selective state update for decode phase.
+// Processes state updates with configurable parallelization parameters.
 //
 // Args:
 //   state: (batch, nheads, dim, dstate) - SSM state tensor, updated in-place
@@ -26,6 +26,8 @@ namespace mamba {
 //   dt_bias: (nheads, dim) or None - bias for dt
 //   out: (batch, nheads, dim) - output tensor
 //   dt_softplus: whether to apply softplus to dt
+//   block_size_m: dim elements per block (default: 32)
+//   threads_per_block: threads per block (default: 128)
 //
 void selective_state_update_cuda(
     torch::Tensor& state,                   // [batch, nheads, dim, dstate]
@@ -38,7 +40,10 @@ void selective_state_update_cuda(
     const c10::optional<torch::Tensor>& z,  // [batch, nheads, dim]
     const c10::optional<torch::Tensor>& dt_bias,  // [nheads, dim]
     torch::Tensor& out,                           // [batch, nheads, dim]
-    bool dt_softplus);
+    bool dt_softplus,
+    int64_t block_size_m,      // dim elements per block
+    int64_t threads_per_block  // threads per block
+);
 
 }  // namespace mamba
 }  // namespace vllm

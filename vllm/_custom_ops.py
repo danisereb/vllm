@@ -2044,13 +2044,41 @@ def selective_state_update_cuda(
     dt_bias: torch.Tensor | None,
     out: torch.Tensor,
     dt_softplus: bool,
+    block_size_m: int = 32,
+    threads_per_block: int = 128,
 ) -> None:
     """
-    Optimized SSM decode kernel for Blackwell (B200) GPUs.
-    Specialized for dim=64, dstate=128, nheads/ngroups=8 (Nemotron-H config).
+    Configurable SSM decode kernel for Blackwell (B200) GPUs.
+
+    Args:
+        state: (batch, nheads, dim, dstate) - SSM state, updated in-place
+        x: (batch, nheads, dim) - input tensor
+        dt: (batch, nheads, dim) - delta time tensor
+        A: (nheads, dim, dstate) - state transition matrix
+        B: (batch, ngroups, dstate) - input projection
+        C: (batch, ngroups, dstate) - output projection
+        D: (nheads, dim) or None - skip connection
+        z: (batch, nheads, dim) or None - gate tensor
+        dt_bias: (nheads, dim) or None - bias for dt
+        out: (batch, nheads, dim) - output tensor
+        dt_softplus: whether to apply softplus to dt
+        block_size_m: dim elements per block (default: 32, try 16-128)
+        threads_per_block: threads per block (default: 128, try 64-256)
     """
     torch.ops._C.selective_state_update_cuda(
-        state, x, dt, A, B, C, D, z, dt_bias, out, dt_softplus
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D,
+        z,
+        dt_bias,
+        out,
+        dt_softplus,
+        block_size_m,
+        threads_per_block,
     )
 
 

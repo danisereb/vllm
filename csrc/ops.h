@@ -368,14 +368,13 @@ void selective_scan_fwd(
     const std::optional<torch::Tensor>& initial_state_idx);
 
 // Optimized SSM decode kernel for Blackwell (B200)
-void selective_state_update_cuda(torch::Tensor& state, const torch::Tensor& x,
-                                 const torch::Tensor& dt,
-                                 const torch::Tensor& A, const torch::Tensor& B,
-                                 const torch::Tensor& C,
-                                 const std::optional<torch::Tensor>& D,
-                                 const std::optional<torch::Tensor>& z,
-                                 const std::optional<torch::Tensor>& dt_bias,
-                                 torch::Tensor& out, bool dt_softplus);
+void selective_state_update_cuda(
+    torch::Tensor& state, const torch::Tensor& x, const torch::Tensor& dt,
+    const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& C,
+    const std::optional<torch::Tensor>& D,
+    const std::optional<torch::Tensor>& z,
+    const std::optional<torch::Tensor>& dt_bias, torch::Tensor& out,
+    bool dt_softplus, int64_t block_size_m, int64_t threads_per_block);
 
 torch::Tensor dynamic_4bit_int_moe_cpu(
     torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
