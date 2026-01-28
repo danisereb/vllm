@@ -380,6 +380,37 @@ def selective_state_update(
     if num_accepted_tokens is not None:
         assert num_accepted_tokens.shape == (N,)
 
+    # Use optimized CUDA kernel for simple decode cases on Blackwell
+    # Conditions: no batch indices, no varlen, float32 state, matching dims
+    use_cuda_kernel = (
+        is_blackwell
+        and state_batch_indices is None
+        and cu_seqlens is None
+        and num_accepted_tokens is None
+        and state.dtype == torch.float32
+        and dim == 64
+        and dstate == 128
+        and nheads % ngroups == 0
+        and nheads // ngroups == 8
+    )
+
+    if use_cuda_kernel:
+        # Use optimized CUDA kernel
+        ops.selective_state_update_cuda(
+            state,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            z,
+            dt_bias,
+            out,
+            dt_softplus,
+        )
+        return
+
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), N, nheads)
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
     state_batch_indices_strides = (

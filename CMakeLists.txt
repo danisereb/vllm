@@ -281,6 +281,7 @@ endif()
 
 set(VLLM_EXT_SRC
   "csrc/mamba/mamba_ssm/selective_scan_fwd.cu"
+  "csrc/mamba/mamba_ssm/selective_state_update.cu"
   "csrc/cache_kernels.cu"
   "csrc/cache_kernels_fused.cu"
   "csrc/attention/paged_attention_v1.cu"

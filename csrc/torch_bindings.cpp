@@ -2,6 +2,7 @@
 #include "cuda_utils.h"
 #include "ops.h"
 #include "core/registration.h"
+#include "mamba/mamba_ssm/selective_state_update.h"
 
 #include <torch/library.h>
 #include <torch/version.h>
@@ -639,6 +640,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? block_idx_last_scheduled_token,"
       "Tensor? initial_state_idx) -> ()");
   ops.impl("selective_scan_fwd", torch::kCUDA, &selective_scan_fwd);
+
+  // Optimized SSM decode kernel for Blackwell (B200)
+  ops.def(
+      "selective_state_update_cuda(Tensor! state, Tensor x, Tensor dt,"
+      "Tensor A, Tensor B, Tensor C,"
+      "Tensor? D, Tensor? z, Tensor? dt_bias,"
+      "Tensor! out, bool dt_softplus) -> ()");
+  ops.impl("selective_state_update_cuda", torch::kCUDA,
+           &vllm::mamba::selective_state_update_cuda);
 
   // Hadamard transforms
   ops.def("hadacore_transform(Tensor! x, bool inplace) -> Tensor");
