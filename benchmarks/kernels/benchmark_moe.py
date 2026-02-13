@@ -5,6 +5,7 @@ import argparse
 import gc
 import json
 import os
+import random
 import time
 from contextlib import nullcontext
 from datetime import datetime
@@ -312,12 +313,12 @@ def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int
         # Reduced search space for faster tuning.
         # TODO(woosuk): Increase the search space and use a performance model to
         # prune the search space.
-        block_m_range = [16, 32, 64, 128, 256]
+        block_m_range = [16, 32, 64, 128]
         block_n_range = [32, 64, 128, 256]
-        block_k_range = [64, 128, 256]
-        num_warps_range = [4, 8]
-        group_m_range = [1, 16, 32, 64]
-        num_stage_range = [2, 3, 4, 5]
+        block_k_range = [32, 64, 128, 256]
+        num_warps_range = [4, 8, 16]
+        group_m_range = [1, 2, 4, 8, 16, 32, 64]
+        num_stage_range = [3, 4, 5, 6]
 
         param_ranges = {
             "BLOCK_SIZE_M": block_m_range,
@@ -811,6 +812,17 @@ def main(args: argparse.Namespace):
     if args.tune:
         is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16)
         search_space = get_configs_compute_bound(is_fp16, block_quant_shape)
+
+        # Limit search space if max_configs is specified
+        if args.max_configs is not None and len(search_space) > args.max_configs:
+            original_count = len(search_space)
+            random.seed(42)  # Use fixed seed for reproducibility
+            search_space = random.sample(search_space, args.max_configs)
+            print(
+                f"Limited search space from {original_count} "
+                f"to {args.max_configs} configurations (random sampling)"
+            )
+
         print(f"Start tuning over {len(search_space)} configurations...")
         if use_deep_gemm:
             raise ValueError(
@@ -898,6 +910,14 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, nargs="+", required=False)
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument(
+        "--max-configs",
+        type=int,
+        default=None,
+        help="Limit the search space to at most this many configurations. "
+        "If specified, randomly samples from the full search space. "
+        "Useful for faster tuning when the full search space is too large.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--model-prefix", type=str, required=False)
     args = parser.parse_args()
